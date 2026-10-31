@@ -1,0 +1,668 @@
+"""Explicit owned-process adapter with application-verified checkpoint protocol.
+
+No process is discovered/adopted by PID, no existing queue is edited, and this
+adapter does not grant real resource admission. Its caller supplies the existing
+arbiter and a separately authorized immutable command specification.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from threading import RLock
+import time
+from typing import Callable
+import uuid
+
+from tools import windows_job
+from tools.runtime_supervisor import (
+    _capture_posix_process_fence,
+    _posix_group_empty,
+    _reap_unassigned_child,
+    _terminate_child,
+    _terminate_unfenced_posix_child,
+)
+
+from .adapters import ComputeExecutorAdapter
+from .arbiter import HostLocalArbiter
+from .contracts import Checkpoint, ExitReadback, Grant, Hold, SlotRequest, identity, instant
+
+PROTOCOL = "ocean-owned-process.v1"
+
+# Isolated interpreter startup cannot import sitecustomize or application code.
+# No application (and therefore no helper) runs until its process group is fenced.
+_POSIX_BOOTSTRAP = """
+import os, select, sys
+fd = int(sys.argv[1])
+if not select.select([fd], [], [], 30)[0] or os.read(fd, 1) != b'G':
+    raise SystemExit(125)
+os.close(fd)
+os.execve(sys.argv[2], sys.argv[2:], dict(os.environ))
+"""
+
+_POSIX_FROZEN_BOOTSTRAP = """
+import os, select, sys
+fd = int(sys.argv[1])
+if not select.select([fd], [], [], 30)[0] or os.read(fd, 1) != b'G':
+    raise SystemExit(125)
+os.close(fd)
+program = sys.argv[2]
+sys.argv = ['-c', *sys.argv[3:]]
+exec(compile(program, '<frozen-workload>', 'exec'))
+"""
+
+# Windows children start as this isolated trusted interpreter, not suspended.
+# Only the gate reader is inherited. The application runs after job assignment
+# and an authenticated native prepare check, so parent death before assignment
+# closes the pipe and the bootstrap exits instead of leaving a suspended child.
+_WINDOWS_GATE = """
+import ctypes, time
+from ctypes import wintypes
+def wait_for_gate(handle_value):
+    handle = wintypes.HANDLE(handle_value)
+    api = ctypes.WinDLL('kernel32', use_last_error=True)
+    api.PeekNamedPipe.restype = wintypes.BOOL
+    api.PeekNamedPipe.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                                   ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD),
+                                   ctypes.POINTER(wintypes.DWORD)]
+    api.ReadFile.restype = wintypes.BOOL
+    api.ReadFile.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD,
+                             ctypes.POINTER(wintypes.DWORD), ctypes.c_void_p]
+    api.CloseHandle.argtypes = [wintypes.HANDLE]
+    api.CloseHandle.restype = wintypes.BOOL
+    deadline = time.monotonic() + 30
+    while True:
+        available = wintypes.DWORD()
+        if not api.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+            raise SystemExit(125)
+        if available.value:
+            break
+        if time.monotonic() >= deadline:
+            raise SystemExit(125)
+        time.sleep(.02)
+    value = ctypes.create_string_buffer(1)
+    read = wintypes.DWORD()
+    if not api.ReadFile(handle, value, 1, ctypes.byref(read), None) or read.value != 1 or value.raw != b'G':
+        raise SystemExit(125)
+    if not api.CloseHandle(handle):
+        raise SystemExit(125)
+"""
+
+_WINDOWS_BOOTSTRAP = _WINDOWS_GATE + """
+import subprocess
+import sys
+wait_for_gate(int(sys.argv[1]))
+completed = subprocess.run(
+    sys.argv[2:],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    close_fds=True,
+    check=False,
+)
+raise SystemExit(completed.returncode)
+"""
+
+_WINDOWS_FROZEN_BOOTSTRAP = _WINDOWS_GATE + """
+import sys
+wait_for_gate(int(sys.argv[1]))
+program = sys.argv[2]
+sys.argv = ['-c', *sys.argv[3:]]
+exec(compile(program, '<frozen-workload>', 'exec'))
+"""
+
+
+def _local_directory(path: Path) -> Path:
+    path = Path(path)
+    if not path.is_absolute() or not path.is_dir() or path.resolve() != path.absolute():
+        raise ValueError("existing unlinked absolute local directory required")
+    if path.drive.startswith("\\\\") or any(p.lower().startswith("onedrive") for p in path.parts):
+        raise ValueError("process state/work directories must be host-local")
+    return path
+
+
+@dataclass(frozen=True)
+class ProcessCommand:
+    argv: tuple[str, ...]
+    cwd: Path
+    # Every executable/application input pin is explicit. No ambient source discovery.
+    source_pins: tuple[tuple[Path, str], ...]
+    environment: tuple[tuple[str, str], ...] = ()
+    source_mode: str = "path-checked"
+
+    def __post_init__(self):
+        if (
+            not isinstance(self.argv, tuple)
+            or not self.argv
+            or any(not isinstance(a, str) or not a or "\x00" in a or len(a) > 8192 for a in self.argv)
+            or sum(len(a) for a in self.argv) > 24000
+        ):
+            raise ValueError("explicit bounded immutable argv required")
+        _local_directory(self.cwd)
+        executable = Path(self.argv[0])
+        if not executable.is_absolute() or not executable.is_file() or executable.is_symlink():
+            raise ValueError("explicit existing executable required")
+        if not isinstance(self.source_pins, tuple) or not self.source_pins:
+            raise ValueError("explicit source pins required")
+        for path, digest in self.source_pins:
+            if (
+                not isinstance(path, Path)
+                or not path.is_absolute()
+                or path.is_symlink()
+                or path.resolve() != path.absolute()
+                or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+            ):
+                raise ValueError("invalid exact source pin")
+        if executable not in {path for path, _ in self.source_pins}:
+            raise ValueError("the executable itself must be pinned")
+        if (
+            not isinstance(self.environment, tuple)
+            or any(
+                not isinstance(k, str) or not k or "=" in k or "\x00" in k or k == "OCEAN_RESOURCE_RUN_DIR"
+                or not isinstance(v, str) or "\x00" in v
+                for k, v in self.environment
+            )
+            or len(dict(self.environment)) != len(self.environment)
+        ):
+            raise ValueError("explicit immutable environment required")
+        if sum(len(k) + len(v) for k, v in self.environment) > 16000:
+            raise ValueError("process environment exceeds bound")
+        if self.source_mode not in {"path-checked", "frozen-python"}:
+            raise ValueError("unsupported process source mode")
+        if self.source_mode == "frozen-python" and (
+            len(self.argv) < 2 or executable != Path(sys.executable).resolve()
+            or self.argv[1].startswith("-") or len(self.source_pins) != 2
+            or {path for path, _ in self.source_pins} != {executable, Path(self.argv[1])}
+        ):
+            raise ValueError("frozen Python requires the current trusted interpreter and one pinned script")
+
+    def execution_argv(self) -> tuple[str, ...]:
+        """Freeze verified application bytes into argv, without reopening its path.
+
+        The Python runtime/stdlib and operator-provided code are trusted. This is
+        source consistency, not an OS sandbox or a claim about runtime data files.
+        """
+        if self.source_mode == "path-checked":
+            return self.argv
+        script = Path(self.argv[1])
+        expected = dict(self.source_pins)[script]
+        with script.open("rb") as stream:
+            content = stream.read(8193)
+        if len(content) > 8192 or hashlib.sha256(content).hexdigest() != expected:
+            raise Hold("frozen application source changed or exceeds its bounded scope")
+        encoded = base64.b64encode(content).decode("ascii")
+        program = ("import base64,sys;sys.argv=sys.argv[1:];"
+                   "__file__=sys.argv[0];"
+                   f"exec(compile(base64.b64decode({encoded!r}),__file__,'exec'))")
+        argv = (self.argv[0], "-I", "-S", "-c", program, *self.argv[1:])
+        if sum(len(arg) for arg in argv) > 24000:
+            raise Hold("frozen application argv exceeds its bounded scope")
+        return argv
+
+    def verify_sources(self):
+        for path, digest in self.source_pins:
+            calculated = hashlib.sha256()
+            if path.is_symlink() or not path.is_file():
+                raise Hold("pinned process source changed or unavailable")
+            with path.open("rb") as stream:
+                while block := stream.read(1024 * 1024):
+                    calculated.update(block)
+            if calculated.hexdigest() != digest:
+                raise Hold("pinned process source changed or unavailable")
+
+    def fingerprint(self) -> str:
+        """Bind the fixed command; the protocol run-directory variable is dynamic."""
+        content = json.dumps({"argv": self.argv, "cwd": str(self.cwd),
+                              "source_pins": [(str(p), h) for p, h in self.source_pins],
+                              "environment": self.environment, "source_mode": self.source_mode},
+                             sort_keys=True, separators=(",", ":"),
+                             ensure_ascii=False, allow_nan=False).encode("utf-8")
+        return hashlib.sha256(content).hexdigest()
+
+
+@dataclass
+class _Execution:
+    grant: Grant
+    identity: str
+    directory: Path
+    child: subprocess.Popen
+    fence: dict | None
+    job: int | None
+    accepted: Checkpoint | None = None
+    exited: bool = False
+    process_identity: dict | None = None
+
+
+class OwnedProcessExecutor:
+    """New explicitly configured children only; application owns checkpoint meaning.
+
+    The worker reads start.json from OCEAN_RESOURCE_RUN_DIR, acknowledges ready.json,
+    and on checkpoint.request.json writes a quiescent checkpoint.json with the same
+    grant/execution identity and an application payload. A trusted application
+    validator must approve that payload before any stop. Cooperative workers must
+    not escape their owned job/process group or continue after acknowledging quiescence.
+    """
+
+    def __init__(
+        self,
+        arbiter: HostLocalArbiter,
+        command: ProcessCommand,
+        state_directory: Path,
+        validate_checkpoint: Callable[[dict], bool],
+        *,
+        timeout_seconds: float = 5.0,
+    ):
+        if not instant(timeout_seconds) or not 0 < timeout_seconds <= 30:
+            raise ValueError("bounded lifecycle timeout required")
+        if not callable(validate_checkpoint):
+            raise ValueError("application checkpoint validator required")
+        self.arbiter, self.command = arbiter, command
+        self.state_directory = _local_directory(state_directory)
+        self.validator, self.timeout = validate_checkpoint, timeout_seconds
+        self._executions: dict[Grant, _Execution] = {}
+        self._mutex = RLock()
+        self._pid = os.getpid()
+
+    def _require_process(self):
+        if os.getpid() != self._pid:
+            raise Hold("foreign owned-executor process")
+
+    @staticmethod
+    def _process_times(pid: int) -> tuple[float | None, float | None]:
+        """Capture optional native PID-reuse and boot-time clues, never admission."""
+        try:
+            from .capacity import _psutil
+
+            backend = _psutil()
+            created_at = float(backend.Process(pid).create_time())
+            boot_time = float(backend.boot_time())
+            if not instant(created_at) or not instant(boot_time):
+                return None, None
+            return created_at, boot_time
+        except Exception:
+            return None, None
+
+    def _execution_evidence(self, run: _Execution, *, gate_state: str) -> dict:
+        if run.process_identity is None:
+            created_at, boot_time = self._process_times(run.child.pid)
+            run.process_identity = {
+                "pid": run.child.pid,
+                "created_at": created_at,
+                "boot_time": boot_time,
+            }
+        if os.name == "nt":
+            if run.job is None:
+                raise Hold("Windows recovery evidence requires the assigned kill-on-close job")
+            containment = {"kind": "windows-kill-on-close-job", "assigned": True}
+        else:
+            if run.fence is None:
+                raise Hold("POSIX recovery evidence requires the captured process group")
+            containment = {"kind": "posix-session-group", "pgid": run.fence["pgid"], "sid": run.fence["sid"]}
+        return {
+            "schema": "ocean-process-evidence.v1",
+            "grant": asdict(run.grant),
+            "execution_identity": run.identity,
+            "command_sha256": self.command.fingerprint(),
+            "run_directory": str(run.directory.resolve()),
+            "owner_pid": os.getpid(),
+            "process": dict(run.process_identity),
+            "containment": containment,
+            "gate_state": gate_state,
+            "recorded_at": time.time(),
+        }
+
+    def _record_checkpoint_evidence(self, run: _Execution):
+        if run.accepted is None or not run.accepted.valid_for(run.grant):
+            raise Hold("cannot persist evidence for an unverified checkpoint")
+        path = run.directory / "accepted.checkpoint.json"
+        if path.is_symlink():
+            raise Hold("linked accepted checkpoint refused")
+        try:
+            with path.open("rb") as stream:
+                raw = stream.read(1024 * 1024 + 1)
+        except OSError as exc:
+            raise Hold("persisted accepted checkpoint is unavailable") from exc
+        if len(raw) > 1024 * 1024:
+            raise Hold("accepted checkpoint evidence exceeds bound")
+        if self._decode_message(raw) != asdict(run.accepted):
+            raise Hold("persisted accepted checkpoint changed or is unavailable")
+        evidence = {
+            "schema": "ocean-checkpoint-evidence.v1",
+            "grant": asdict(run.grant),
+            "execution_identity": run.identity,
+            "command_sha256": self.command.fingerprint(),
+            "run_directory": str(run.directory.resolve()),
+            "checkpoint_file": str(path.resolve()),
+            "checkpoint_file_sha256": hashlib.sha256(raw).hexdigest(),
+            "payload_sha256": run.accepted.payload_sha256,
+            "recorded_at": time.time(),
+        }
+        return self.arbiter.record_checkpoint_evidence(run.grant, evidence)
+
+    def adapter(self) -> ComputeExecutorAdapter:
+        return ComputeExecutorAdapter(self.start, self.checkpoint, self.stop, self.readback,
+                                      self.command.fingerprint(), "cpu-owned-process")
+
+    @staticmethod
+    def _write(path: Path, payload: dict):
+        temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+        data = json.dumps(payload, sort_keys=True, allow_nan=False).encode("utf-8")
+        if len(data) > 1024 * 1024:
+            raise Hold("lifecycle message exceeds bound")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+
+    @staticmethod
+    def _message(path: Path) -> dict | None:
+        if not path.exists():
+            return None
+        if path.is_symlink():
+            raise Hold("linked worker response refused")
+        with path.open("rb") as stream:
+            raw = stream.read(1024 * 1024 + 1)
+        return OwnedProcessExecutor._decode_message(raw)
+
+    @staticmethod
+    def _decode_message(raw: bytes) -> dict:
+        if len(raw) > 1024 * 1024:
+            raise Hold("worker response exceeds bound")
+
+        def unique(pairs):
+            value = {}
+            for key, item in pairs:
+                if key in value:
+                    raise Hold("duplicate worker response key")
+                value[key] = item
+            return value
+
+        def reject_constant(value):
+            raise Hold("nonfinite worker response")
+
+        value = json.loads(raw, object_pairs_hook=unique, parse_constant=reject_constant)
+        if not isinstance(value, dict):
+            raise Hold("worker response must be an object")
+        return value
+
+    def _execution(self, grant: Grant, execution_identity: str) -> _Execution:
+        self.arbiter.request_for(grant)
+        run = self._executions.get(grant)
+        if run is None or run.identity != execution_identity:
+            raise Hold("unknown owned execution")
+        return run
+
+    def _wait_message(self, run: _Execution, name: str) -> dict:
+        deadline = time.monotonic() + self.timeout
+        while True:
+            value = self._message(run.directory / name)
+            if value is not None:
+                if (
+                    value.get("schema") != PROTOCOL
+                    or value.get("execution_identity") != run.identity
+                    or value.get("grant") != asdict(run.grant)
+                ):
+                    raise Hold("worker response belongs to another execution")
+                return value
+            if time.monotonic() >= deadline:
+                raise Hold("owned worker lifecycle acknowledgement timed out")
+            time.sleep(0.02)
+
+    def start(self, grant: Grant, request: SlotRequest, checkpoint: Checkpoint | None, execution_identity: str) -> bool:
+        self._require_process()
+        with self._mutex:
+            self.arbiter.require_running(grant)
+            identity(execution_identity)
+            if request != self.arbiter.request_for(grant) or grant in self._executions:
+                raise Hold("inconsistent or already-started execution")
+            if self.arbiter.status()["execution_identity"] != execution_identity:
+                raise Hold("execution identity was not bound by the arbiter")
+            if checkpoint != self.arbiter.checkpoint_for(grant.request_id):
+                raise Hold("resume checkpoint is not the arbiter's verified predecessor")
+            self.command.verify_sources()
+            execution_argv = self.command.execution_argv()
+            self.arbiter.require_workload(grant, self.command.fingerprint(), kind="cpu-owned-process")
+            directory = self.state_directory / uuid.uuid4().hex
+            directory.mkdir(mode=0o700)
+            self._write(
+                directory / "start.json",
+                {
+                    "schema": PROTOCOL,
+                    "grant": asdict(grant),
+                    "execution_identity": execution_identity,
+                    "resume": json.loads(checkpoint.payload_json) if checkpoint else None,
+                },
+            )
+            environment = {**dict(self.command.environment), "OCEAN_RESOURCE_RUN_DIR": str(directory)}
+            job = None
+            child = None
+            fence = None
+            gate_read = gate_write = None
+            try:
+                flags = 0
+                argv = execution_argv
+                spawn_options = {}
+                if os.name == "nt":
+                    job = windows_job.create_kill_on_close_job()
+                    gate_read, gate_write = os.pipe()
+                    os.set_inheritable(gate_read, True)
+                    import msvcrt
+                    gate_handle = msvcrt.get_osfhandle(gate_read)
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.lpAttributeList = {"handle_list": [gate_handle]}
+                    spawn_options.update(startupinfo=startupinfo, close_fds=True)
+                    argv = (str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                            _WINDOWS_BOOTSTRAP, str(gate_handle), *execution_argv)
+                    if self.command.source_mode == "frozen-python":
+                        argv = (str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                                _WINDOWS_FROZEN_BOOTSTRAP, str(gate_handle), *execution_argv[4:])
+                    flags = subprocess.CREATE_NO_WINDOW
+                else:
+                    gate_read, gate_write = os.pipe()
+                    argv = (
+                        str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                        _POSIX_BOOTSTRAP, str(gate_read), *execution_argv,
+                    )
+                    if self.command.source_mode == "frozen-python":
+                        argv = (str(Path(sys.executable).resolve()), "-I", "-S", "-c",
+                                _POSIX_FROZEN_BOOTSTRAP, str(gate_read), *execution_argv[4:])
+                    spawn_options["pass_fds"] = (gate_read,)
+                child = subprocess.Popen(
+                    argv,
+                    cwd=self.command.cwd,
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=flags,
+                    start_new_session=os.name != "nt",
+                    **spawn_options,
+                )
+                if gate_read is not None:
+                    os.close(gate_read)
+                    gate_read = None
+                if os.name == "nt":
+                    try:
+                        windows_job.assign_and_resume(job, child, False)
+                    except BaseException:
+                        # Before assignment, this child is only a gated isolated
+                        # interpreter. Reap exactly the returned Popen handle.
+                        if _reap_unassigned_child(child) is not None:
+                            raise Hold("unassigned gated bootstrap cleanup failed")
+                        raise
+                else:
+                    fence = _capture_posix_process_fence(child.pid)
+                run = _Execution(grant, execution_identity, directory, child, fence, job)
+                self._executions[grant] = run
+                self.arbiter.record_execution_evidence(
+                    grant, self._execution_evidence(run, gate_state="closed")
+                )
+                if gate_write is not None:
+                    self.command.verify_sources()
+                    self.arbiter.prepare_execution(grant, self.command.fingerprint(), source_mode=self.command.source_mode)
+                    self.arbiter.record_execution_evidence(
+                        grant, self._execution_evidence(run, gate_state="may-open")
+                    )
+                    os.write(gate_write, b"G")
+                    os.close(gate_write)
+                    gate_write = None
+                self._wait_message(run, "ready.json")
+                self.arbiter.require_running(grant)
+                return True
+            except BaseException:
+                cleaned = False
+                try:
+                    if child is not None:
+                        if os.name != "nt" and fence is None:
+                            # Only the isolated waiting bootstrap can exist here.
+                            _terminate_unfenced_posix_child(child, self.timeout)
+                            if child.poll() is None:
+                                raise Hold("waiting bootstrap cleanup is unconfirmed")
+                        else:
+                            _terminate_child(child, self.timeout, process_fence=fence, job_handle=job)
+                    cleaned = True
+                finally:
+                    if job is not None:
+                        windows_job.close_job(job)
+                        if grant in self._executions:
+                            self._executions[grant].job = None
+                    if cleaned:
+                        self._executions.pop(grant, None)
+                raise
+            finally:
+                for descriptor in (gate_read, gate_write):
+                    if descriptor is not None:
+                        os.close(descriptor)
+
+    def checkpoint(self, grant: Grant, execution_identity: str) -> Checkpoint:
+        self._require_process()
+        with self._mutex:
+            run = self._execution(grant, execution_identity)
+            if run.accepted is not None:
+                if not run.accepted.valid_for(grant):
+                    raise Hold("persisted accepted checkpoint changed or is unavailable")
+                self._record_checkpoint_evidence(run)
+                return run.accepted
+            if run.exited:
+                raise Hold("exited execution has no verified accepted checkpoint")
+            self._write(
+                run.directory / "checkpoint.request.json",
+                {"schema": PROTOCOL, "grant": asdict(grant), "execution_identity": execution_identity},
+            )
+            value = self._wait_message(run, "checkpoint.json")
+            payload = value.get("payload")
+            if (
+                value.get("quiescent") is not True
+                or not isinstance(payload, dict)
+                or self.validator(payload) is not True
+            ):
+                raise Hold("application checkpoint is not verified and quiescent")
+            run.accepted = Checkpoint.create(grant, payload)
+            self._write(run.directory / "accepted.checkpoint.json", asdict(run.accepted))
+            self._record_checkpoint_evidence(run)
+            return run.accepted
+
+    def stop(self, grant: Grant, execution_identity: str, checkpoint: Checkpoint):
+        self._require_process()
+        with self._mutex:
+            run = self._execution(grant, execution_identity)
+            if run.accepted != checkpoint or not checkpoint.valid_for(grant):
+                raise Hold("stop requires this execution's verified checkpoint")
+            evidence = self._record_checkpoint_evidence(run)
+            self.arbiter.require_checkpoint_evidence(grant, evidence)
+            if run.exited:
+                # A failed capacity readback must be retryable without signalling
+                # a closed Windows job or a potentially reused POSIX group.
+                return
+            _terminate_child(run.child, self.timeout, process_fence=run.fence, job_handle=run.job)
+            deadline = time.monotonic() + self.timeout
+            while not self._empty(run):
+                if time.monotonic() >= deadline:
+                    raise Hold("owned process tree is not confirmed empty")
+                time.sleep(0.02)
+            run.exited = True
+            if run.job is not None:
+                windows_job.close_job(run.job)
+                run.job = None
+
+    @staticmethod
+    def _empty(run: _Execution) -> bool:
+        if run.child.poll() is None:
+            return False
+        if os.name == "nt":
+            return run.job is not None and windows_job.active_process_count(run.job) == 0
+        return run.fence is not None and _posix_group_empty(run.fence["pgid"])
+
+    def readback(self, grant: Grant, execution_identity: str) -> ExitReadback:
+        self._require_process()
+        with self._mutex:
+            run = self._execution(grant, execution_identity)
+            exited = run.exited and run.child.poll() is not None
+            return ExitReadback(grant, execution_identity, exited, 0 if exited else None, time.monotonic())
+
+    def measure_usage(self, grant: Grant, execution_identity: str) -> dict:
+        """Observe only a currently owned live tree; samples are not peak bounds.
+
+        Short-lived/reparented children and external/GPU allocations can escape
+        discrete sampling. Such workloads require separate evidence/review.
+        No process is adopted, signalled or granted capacity by this method.
+        """
+        self._require_process()
+        with self._mutex:
+            run = self._execution(grant, execution_identity)
+            if run.exited or run.child.poll() is not None:
+                raise Hold("usage measurement requires this owned live execution")
+            from .capacity import _psutil
+            try:
+                started = time.monotonic()
+                backend = _psutil()
+                process = backend.Process(run.child.pid)
+                family = [process, *process.children(recursive=True)]
+                if len(family) > 256:
+                    raise ValueError("process observation exceeds bound")
+                members = []
+                for member in family:
+                    with member.oneshot():
+                        created = member.create_time()
+                        rss = member.memory_info().rss
+                        cpu = member.cpu_times()
+                    seconds = cpu.user + cpu.system
+                    if not instant(created) or not instant(seconds) or type(rss) is not int or rss < 0:
+                        raise ValueError("process resource counters unavailable")
+                    members.append({"pid": member.pid, "created_at": created, "rss_bytes": rss, "cpu_seconds": seconds})
+                if run.child.poll() is not None or not instant(started):
+                    raise ValueError("owned execution exited during resource observation")
+                return {"schema": "ocean-owned-usage-sample.v1", "grant": asdict(grant),
+                        "execution_identity": execution_identity, "observed_at": started,
+                        "members": members, "rss_bytes": sum(m["rss_bytes"] for m in members),
+                        "cpu_seconds": sum(m["cpu_seconds"] for m in members),
+                        "scope": "sampled-live-process-tree-not-an-external-residency-proof"}
+            except Exception as exc:
+                raise Hold("owned process resource observation failed") from exc
+
+    def close(self):
+        """Own-process emergency cleanup; never releases the arbiter or claims a checkpoint."""
+        if os.getpid() != self._pid:
+            return  # A forked child must never signal the parent's owned work.
+        with self._mutex:
+            for run in self._executions.values():
+                if not run.exited:
+                    _terminate_child(run.child, self.timeout, process_fence=run.fence, job_handle=run.job)
+                    if run.job is not None:
+                        windows_job.close_job(run.job)
+                        run.job = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()

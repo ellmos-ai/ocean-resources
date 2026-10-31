@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocean-resources"
+version = "0.2.0"
+description = "Herausgelöstes Ocean-Ressourcenmodul: RAM-Distributor, Modell-Runtime-Arbiter, Fähigkeitsmeldung, Nutzernähe-Klassen und Watchdog-Hysterese (#2441)."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Lukas Geiger" }]
+dependencies = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ocean_resources*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
