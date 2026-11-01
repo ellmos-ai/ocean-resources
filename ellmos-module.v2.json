@@ -1,28 +1,47 @@
 {
-  "schema": "ellmos-module.v2",
+  "schema": "ellmos.module.v2",
   "id": "ocean-resources",
+  "display_name": "ocean-resources",
   "version": "0.2.0",
-  "category": "CONTROL",
-  "title": "Ocean Resources & RAM-Distributor",
+  "category": "control",
+  "kind": "library",
+  "status": "active",
+  "visibility": "private",
   "description": "Kanonischer RAM-Distributor, Modell-Runtime-Scheduler, Fackel-Arbiter und Watchdog-Hysterese für BACH und Ocean.",
   "entrypoints": {
-    "python": "ocean_resources",
+    "library": "ocean_resources",
     "cli": "python -m ocean_resources"
   },
-  "roles": [
-    {
-      "id": "resource-arbiter",
-      "label": "Ressourcen- & Modell-Arbiter",
-      "kind": "system",
-      "description": "Überwacht RAM-Reserve, Modell-Residenz und Compute-Vorrang nach Nutzernähe."
-    }
+  "provides": [
+    "control.resources.ram-distributor",
+    "control.resources.model-scheduler",
+    "control.resources.torch-arbiter",
+    "control.resources.watchdog-hysteresis"
   ],
-  "maintenance": [
-    {
-      "id": "watchdog-hysteresis-audit",
-      "label": "Watchdog-Hysterese & Reserve-Prüfung",
-      "schedule": "hourly",
-      "command": "python -m ocean_resources"
-    }
-  ]
+  "requires": [],
+  "optional": [],
+  "conflicts": [],
+  "surfaces": [
+    "library",
+    "cli"
+  ],
+  "state": {
+    "ownership": "module",
+    "location": "user-home"
+  },
+  "boundaries": {
+    "network": "local",
+    "data": "user-local",
+    "platforms": [
+      "windows",
+      "macos",
+      "linux"
+    ]
+  },
+  "source_of_truth": {
+    "type": "git-repository",
+    "path": ".",
+    "repository": "https://github.com/ellmos-ai/ocean-resources"
+  },
+  "adapters": []
 }
