@@ -20,6 +20,15 @@ from .ram_distributor import (
     UserProximity,
     WatchdogHysteresisPolicy,
 )
+from .inference_queue_policy import (
+    MAX_CONSECUTIVE_FOREGROUND,
+    QueuePolicyError,
+    QueuePriority,
+    QueueSelection,
+    QueueTicket,
+    SelectionReason,
+    select_next_ticket,
+)
 
 __all__ = [
     "BACHFacade", "CapacityReadback", "Checkpoint", "ComputeExecutorAdapter",
@@ -33,4 +42,6 @@ __all__ = [
     "HostClient", "HostService",
     "ConsumerCapability", "DistributorRequest", "FallbackDecision",
     "RAMDistributor", "UserProximity", "WatchdogHysteresisPolicy",
+    "MAX_CONSECUTIVE_FOREGROUND", "QueuePolicyError", "QueuePriority",
+    "QueueSelection", "QueueTicket", "SelectionReason", "select_next_ticket",
 ]

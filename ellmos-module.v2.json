@@ -16,7 +16,8 @@
     "control.resources.ram-distributor",
     "control.resources.model-scheduler",
     "control.resources.torch-arbiter",
-    "control.resources.watchdog-hysteresis"
+    "control.resources.watchdog-hysteresis",
+    "control.resources.inference-queue-policy"
   ],
   "requires": [],
   "optional": [],
