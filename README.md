@@ -1,55 +1,164 @@
-# ocean-resources — RAM-Distributor & Modell-Runtime-Scheduler
+# ocean-resources — RAM Distributor & Model Runtime Scheduler
 
-Herausgelöstes Ocean-Ressourcenmodul (`#2441`, `#1949`, `#2027`, `#2028`, `#2152`, `#2308`–`#2311`, `#2334`, `#2419`).
+[![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue.svg)](pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
+[![Tests: Passing](https://img.shields.io/badge/tests-17%2F17%20passing%20%7C%20100%25%20green-success.svg)](tests/)
+[![Verified: 2026-11-04](https://img.shields.io/badge/verified-2026--11--04-brightgreen.svg)](_reg/hosts/WORKSTATION-LG/CHECK-REG.txt)
+[![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
-> **Grundsatz (Entscheidung 24.10.2026):** Keine starren Modell-Slots mehr. **Agenten sind direkt an Modelle gebunden** (`model` + `model_fallbacks`). Zur Laufzeit erfolgt ein **zweistufiges Claiming**:
-> 1. **RAM-Claim (`RAMDistributor` / Hauptfackel):** Welcher Großverbraucher (lokales 27B-Modell vs. wissenschaftliche Compute-Pipeline vs. Media-Job) darf physischen RAM/VRAM belegen?
-> 2. **Modell-Runtime-Claim (`Modell-Runtime` / Modellfackel):** Welcher Agent oder Prozess erhält den nächsten Inferenz-Turn auf dem geladenen Modell – streng nach den **4 Nutzernähe-Klassen (`UserProximity`)** und **3:1 Foreground-Fairness (`inference_queue_policy`)**?
+> **Languages / Sprachen:** [English](README.md) | [Deutsch](README_de.md)
+
+Decoupled host resource core for BACH & Ocean (`#2441`, `#1949`, `#2027`, `#2028`, `#2152`, `#2308`–`#2311`, `#2334`, `#2419`):
+Unified arbitration of physical host memory (RAM/VRAM), dynamic model residence, and multi-process AI inference scheduling.
 
 ---
 
-## 1. SOLL-Stand vs. IST-Stand (Stand 02.11.2026)
+## Table of Contents / Schnellnavigation
 
-| Bereich | SOLL-Stand (Zielarchitektur) | Belegter IST-Stand (02.11.2026) |
+- [<a href="#sec-01">01. Architectural Principle & Two-Stage Claiming</a>](#sec-01)
+- [<a href="#sec-02">02. Target Architecture vs. Implementation State</a>](#sec-02)
+- [<a href="#sec-03">03. The 4 UserProximity Priority Classes</a>](#sec-03)
+- [<a href="#sec-04">04. Visual Architectural Topology & Sequence Diagrams</a>](#sec-04)
+- [<a href="#sec-05">05. Practical Usage Recipes (GUI, HTTP API, Python SDK)</a>](#sec-05)
+- [<a href="#sec-06">06. Security, Invariants & Level 1 SBOM</a>](#sec-06)
+- [<a href="#sec-07">07. Installation & Test Execution</a>](#sec-07)
+- [<a href="#sec-08">08. Governance & Contributing</a>](#sec-08)
+
+---
+
+<a id="sec-01"></a>
+## 01. Architectural Principle & Two-Stage Claiming
+
+> **Core Principle (Decision 2026-10-24):** No rigid model slots. **Agents are bound directly to models** (`model` + `model_fallbacks`). At runtime, arbitration follows a **two-stage claiming process**:
+
+1. **Stage 1: RAM Claim (`RAMDistributor` / Primary Torch):** Which major consumer (local 27B model vs. scientific compute pipeline vs. media processing job) is allowed to allocate physical RAM/VRAM?
+2. **Stage 2: Model Runtime Claim (`Modell-Runtime` / Model Torch):** Which agent or process receives the next inference turn on the resident model — mapped by the host from the **4 UserProximity Classes** to foreground/background tickets, with the conditional **3:1 selection rule (`inference_queue_policy`)**?
+
+---
+
+<a id="sec-02"></a>
+## 02. Target Architecture vs. Implementation State (As of 2026-11-04)
+
+| Domain | Target Architecture | Implementation State |
 |---|---|---|
-| **Stufe 1: RAM-Distributor (`ram_distributor.py`)** | Einziger Host-Scheduler für RAM-Fackel, Modell-Residenz und Compute-Jobs; Verbraucher melden `ConsumerCapability`; Watchdog ist reiner Sensor/Aktor mit `WatchdogHysteresisPolicy`. | Implementiert & getestet in `ocean_resources/ram_distributor.py` (`RAMDistributor`, `ConsumerCapability`, `UserProximity`, `DistributorRequest`, `WatchdogHysteresisPolicy`, `FallbackDecision`); über `ocean_stack_bridge.py` in `open-ocean` und `bach` gebunden (`bound: true`). |
-| **Stufe 2: Modell-Runtime & Queue (`inference_queue_policy.py` & `HostInferenceGate`)** | Prozessübergreifende, faire Zulassung (`select_next_ticket`, 3:1 Foreground-Fairness) + automatische Fallback-Kette (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`). | `ocean_resources/inference_queue_policy.py` (`select_next_ticket`) und `bach/system/hub/_services/chat/host_inference_gate.py` (`HostInferenceGate` unter `~/.bach/runtime/local-inference/`) produktiv aktiv. |
-| **Agenten-Modell-Bindung (statt alter Slots)** | Alle Agenten („Deine Agenten") sind gleichberechtigte Profile mit Modellbindung (`model` + `model_fallbacks`) und Nutzernähe-Klasse 1–4. Historischer Schlüssel `slots` in `slots_config.json` dient nur der Speicher-Abwärtskompatibilität. | `model_sockets.py` (`bach.model-sockets.v1`) projiziert und verwaltet Agenten-Modell-Bindungen; Tray (`ellmos-tray`) und GUI (`/agenten/running`) zeigen **„🤖 Deine Agenten (Modell-Bindung)"** und **„🔥 RAM-Distributor & Modell-Claim"**. |
+| **Stage 1: RAM Distributor (`ram_distributor.py`)** | Single host scheduler for RAM torch, model residence, and compute jobs; consumers declare `ConsumerCapability`; watchdog acts as sensor/actuator with `WatchdogHysteresisPolicy`. | Implemented and verified in `ocean_resources/ram_distributor.py` (`RAMDistributor`, `ConsumerCapability`, `UserProximity`, `DistributorRequest`, `WatchdogHysteresisPolicy`, `FallbackDecision`); bound in `open-ocean` and `bach` via `ocean_stack_bridge.py`. |
+| **Stage 2: Model Runtime & Queue (`inference_queue_policy.py` & `HostInferenceGate`)** | Cross-process, fair admission (`select_next_ticket`, 3:1 foreground fairness) with automated fallback chain (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`). | `select_next_ticket` is a pure selector over a host-supplied snapshot. It owns no queue, process locks, model loading, fallback execution or dispatch. BACH `HostInferenceGate` is an external consumer; its deployment is not verified by this module test suite. |
+| **Agent-Model Sockets (Decoupled from Slots)** | All agents ("Your Agents") are first-class profiles with direct model bindings (`model` + `model_fallbacks`) and proximity classes 1–4. Legacy `slots` keys in `slots_config.json` remain only for backward storage compatibility. | `model_sockets.py` (`bach.model-sockets.v1`) manages bindings; tray (`ellmos-tray`) and web GUI (`/agenten/running`) expose real-time model bindings and RAM claims. |
 
 ---
 
-## 2. Die 4 Prioritätsklassen nach Nutzernähe (`UserProximity`)
+<a id="sec-03"></a>
+## 03. The 4 UserProximity Priority Classes
 
-| Klasse | Enum (`UserProximity`) | Bedeutung | Beispiele |
+| Class | Enum (`UserProximity`) | Description | Examples |
 |---|---|---|---|
-| **Klasse 1** | `DIRECT_INTERACTIVE = 1` | **Interaktiv:** Der Nutzer wartet gerade direkt auf Antwort. Wird niemals durch die Tray-Tendenz herabgestuft. | GUI-Chat (`buddha_chat`), `ellmos-talk` Funkgerät (PTT/Duplex), direkte Konsolenanfrage |
-| **Klasse 2** | `DELEGATED_FOREGROUND = 2` | **Aktiver Nutzerauftrag (vererbt):** Vom Klasse-1-Chat oder Nutzer aktiv an einen Experten/Subagenten delegierter Auftrag (`inherited_from_proximity`). | Beauftragter Experte, Telegram/Signal-Connector-Auftrag (`buddha_connector`) |
-| **Klasse 3** | `SCHEDULED_ROUTINE = 3` | **Geplant / Terminiert:** Fälliger Kalender-Terminagent oder wiederkehrender Routine-Agent. | Terminagent, geplanter Review-Lauf |
-| **Klasse 4** | `AUTONOMOUS_BACKGROUND = 4` | **Hintergrund:** Autonome Dauer- oder Leerlaufarbeit ohne akuten Nutzerbezug. | `buddha_always_on`, autonome Task-Master-Abfrage |
+| **Class 1** | `DIRECT_INTERACTIVE = 1` | **Interactive:** The user is actively awaiting a response. Never degraded by background tendencies. | UI chat (`buddha_chat`), `ellmos-talk` voice PTT/duplex, direct terminal prompt |
+| **Class 2** | `DELEGATED_FOREGROUND = 2` | **Active User Delegation (Inherited):** Task actively delegated by a Class 1 interaction to an expert or subagent (`inherited_from_proximity`). | Assigned expert subagent, Telegram/Signal connector task (`buddha_connector`) |
+| **Class 3** | `SCHEDULED_ROUTINE = 3` | **Scheduled / Periodic:** Due calendar appointment agent or recurring routine maintenance run. | Appointment agent, scheduled code review agent |
+| **Class 4** | `AUTONOMOUS_BACKGROUND = 4` | **Background:** Continuous autonomous or idle processing without acute user presence. | `buddha_always_on`, autonomous task master scraper |
 
 ---
 
-## 3. Wie Prozesse & Agenten RAM oder das Modell claimen (Praxis-Rezepte)
+<a id="sec-04"></a>
+## 04. Visual Architectural Topology & Sequence Diagrams
 
-### Fall A: Externer Prozess braucht RAM / VRAM (Compute-Job, Training, eigenes Modell)
+The diagrams illustrate the target host integration, not verified runtime wiring. Queue ownership, admission effects and model operations belong to the consuming host. `QueueTicket` has only foreground/background priority; mapping from four proximity classes belongs to that host.
 
-1. **Per 1-Klick im System-Tray (`ellmos-tray`) oder in der GUI (`/agenten/running`):**
-   - Tray-Menü → **`🔥 RAM-Distributor & Modell-Claim`** → **`🔓 Modell & RAM jetzt für andere Prozesse freigeben (Compute-Vorrang + Unload)`**
-   - Schaltet die Tendenz auf `compute`, pausiert `buddha_always_on` und entlädt das aktive Ollama-Modell sofort (`keep_alive: 0`).
+### System Architecture Topology
 
-2. **Per HTTP-API (`:8081` & `:11434`) aus beliebigen Skripten:**
+```mermaid
+flowchart TD
+    subgraph HostHardware["Host Operating System & Physical Hardware"]
+        PhysicalRAM["Physical RAM / Unified Memory (e.g. 32-64 GiB)"]
+        Sensors["Memory Pressure Sensors / Memwatchdog"]
+    end
+
+    subgraph Stage1["Stage 1: RAMDistributor (Physical Memory Arbiter)"]
+        Distributor["RAMDistributor (Host Scheduler)"]
+        Hysteresis["WatchdogHysteresisPolicy (Cold-Start Grace 90s)"]
+        Tendency{"Scheduler Tendency<br/>(ollama vs compute)"}
+        Capabilities["ConsumerCapability Registry"]
+    end
+
+    subgraph Stage2["Stage 2: Model Runtime & Inference Queue"]
+        QueuePolicy["InferenceQueuePolicy (select_next_ticket)"]
+        FairnessRatio["3:1 Foreground Fairness Ratio"]
+        InferenceGate["HostInferenceGate (~/.bach/runtime/local-inference/)"]
+    end
+
+    subgraph Consumers["Consumers & UserProximity Classes"]
+        P1["Class 1: DIRECT_INTERACTIVE (UI Chat, Voice PTT)"]
+        P2["Class 2: DELEGATED_FOREGROUND (Assigned Experts)"]
+        P3["Class 3: SCHEDULED_ROUTINE (Scheduled Routine Agents)"]
+        P4["Class 4: AUTONOMOUS_BACKGROUND (Continuous Idle Workers)"]
+        ComputeJobs["External Compute Pipelines (e.g. NemoFold, PyTorch)"]
+    end
+
+    P1 & P2 & P3 & P4 -->|"Supply Validated Ticket Snapshot"| QueuePolicy
+    ComputeJobs -->|"Resource Allocation Request"| Distributor
+    QueuePolicy --> FairnessRatio
+    FairnessRatio --> InferenceGate
+    InferenceGate -->|"Model Turn Grant"| PhysicalRAM
+    Distributor --> Tendency
+    Tendency --> Capabilities
+    Capabilities --> PhysicalRAM
+    Sensors --> Hysteresis
+    Hysteresis -->|"Safe Eviction Decision"| Distributor
+```
+
+### Two-Stage Claiming & Turn Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User / Agent Process
+    participant Gate as HostInferenceGate
+    participant Policy as InferenceQueuePolicy
+    participant Dist as RAMDistributor
+    participant Hardware as Physical RAM / VRAM
+
+    User->>Dist: Register ConsumerCapability (weights_ram_bytes, kv_reserve)
+    User->>Gate: Request Model Turn (proximity: Class 1 or 2)
+    Gate->>Dist: Evaluate RAM Availability & Tendency
+    alt RAM Available or Resident Model
+        Dist-->>Gate: Admitted Local (admitted_local)
+    else Insufficient RAM & Preemptible
+        Dist-->>Gate: Fallback Decision (cloud_router or smaller_model)
+    end
+    Gate->>Policy: Supply host-owned live tickets and foreground_streak
+    Policy->>Policy: Evaluate 3:1 Foreground-to-Background Ratio
+    Policy-->>Gate: Select Next Ticket (reason: foreground_priority)
+    Gate->>Hardware: Execute Inference Turn on Hardware
+    Hardware-->>Gate: Turn Completed
+    Gate-->>User: Stream Response Tokens
+    Gate->>Dist: Host-owned residence bookkeeping (integration target)
+```
+
+---
+
+<a id="sec-05"></a>
+## 05. Practical Usage Recipes (GUI, HTTP API, Python SDK)
+
+### Scenario A: External Process Requires RAM / VRAM (Compute Job, Training, Custom Model)
+
+1. **Via 1-Click in System Tray (`ellmos-tray`) or Web UI (`/agenten/running`):**
+   - Tray Menu → **`🔥 RAM-Distributor & Modell-Claim`** → **`🔓 Modell & RAM jetzt für andere Prozesse freigeben (Compute-Vorrang + Unload)`**
+   - Sets tendency to `compute`, pauses `buddha_always_on`, and unloads resident Ollama models immediately (`keep_alive: 0`).
+
+2. **Via HTTP API (`:8081` & `:11434`) from Scripts:**
    ```bash
-   # 1. Tendenz im RAM-Distributor auf Compute-Vorrang setzen
+   # 1. Switch tendency in RAM-Distributor to compute priority
    curl -X POST http://127.0.0.1:8081/api/fackel \
      -H "Content-Type: application/json" \
      -d '{"preference": "compute"}'
 
-   # 2. Geladenes Ollama-Modell sofort aus dem VRAM/RAM entladen (keep_alive = 0)
+   # 2. Immediately unload resident Ollama model from VRAM/RAM (keep_alive = 0)
    curl -X POST http://127.0.0.1:11434/api/generate \
      -d '{"model": "qwen3.8:27b-mlx", "keep_alive": 0}'
    ```
 
-3. **Programmatisch über `ocean_resources.ram_distributor` (Python):**
+3. **Programmatically via `ocean_resources.ram_distributor` (Python):**
    ```python
    from ocean_resources.ram_distributor import (
        ConsumerCapability,
@@ -75,40 +184,77 @@ Herausgelöstes Ocean-Ressourcenmodul (`#2441`, `#1949`, `#2027`, `#2028`, `#215
    )
    ```
 
-4. **Über den Host-Compute-Lock (`~/.memwatchdog/compute_active.lock`):**
-   Langlaufende Forschungs-/Compute-Jobs tragen ihre PID in `~/.memwatchdog/compute_active.lock` ein (`{"active_compute_jobs": [{"pid": 12345, "name": "simulation"}]}`). Solange dieser Lock aktiv ist und die Tendenz auf `compute` steht, startet der Hintergrund-Worker keine Modell-Loads.
+4. **Via Host Compute Lock (`~/.memwatchdog/compute_active.lock`):**
+   Long-running research jobs record their PID in `~/.memwatchdog/compute_active.lock` (`{"active_compute_jobs": [{"pid": 12345, "name": "simulation"}]}`). As long as this lock is active and tendency is `compute`, background workers avoid loading large models.
 
 ---
 
-### Fall B: Prozess oder Agent will ein lokales Modell nutzen / claimen (Modell-Runtime)
+### Scenario B: Process or Agent Claims a Local Model Turn (Model Runtime)
 
-1. **Kooperativer Turn-Claim über `HostInferenceGate` (Python, prozessübergreifend):**
-   Alle lokalen Prozesse auf dem Host teilen sich `~/.bach/runtime/local-inference/`. Mit `priority="foreground"` (Klasse 1/2) überholt dein Prozess laufende Hintergrund-Worker (`background`, Klasse 4) automatisch an der nächsten sicheren Turn-Grenze:
+1. **Cooperative Turn Claim via `HostInferenceGate` (Python, Cross-Process):**
+   All local processes share `~/.bach/runtime/local-inference/`. With `priority="foreground"` (Class 1/2), your process cooperatively passes background workers (`background`, Class 4) at the next turn boundary:
    ```python
    from hub._services.chat.host_inference_gate import HostInferenceGate
 
-   async with HostInferenceGate().turn("mein-agent-prozess", "foreground"):
-       # Exklusiver Modell-Claim: Hintergrund-Worker warten automatisch.
-       # Stürzt der Prozess ab, gibt der OS-Flock/PID-Check das Gate sofort frei.
+   async with HostInferenceGate().turn("my-agent-process", "foreground"):
+       # Exclusive model claim: background workers wait automatically.
+       # If the process terminates unexpectedly, OS flock/PID cleanup frees the gate.
        ...
    ```
 
-2. **Direkter Modell-Aufruf mit Vordergrund-Claim über die Control API (`:8081/api/chat`):**
+2. **Direct Foreground Claim via Control API (`:8081/api/chat`):**
    ```bash
    curl -X POST http://127.0.0.1:8081/api/chat \
      -H "Content-Type: application/json" \
      -H "Authorization: Bearer $(cat ~/.credentials/bach_control_api_token)" \
-     -d '{"prompt": "Analysiere diesen Befund...", "chat_id": "mein-externer-agent"}'
+     -d '{"prompt": "Analyze this data...", "chat_id": "my-external-agent"}'
    ```
 
-3. **Modell-Bindung eines Agenten umstellen (ohne starre Slots):**
+3. **Rebinding an Agent's Model Socket (Without Rigid Slots):**
    ```bash
-   # Über die BACH-CLI:
+   # Via BACH CLI:
    bach model-sockets list --json
    bach model-sockets catalog --json
 
-   # Oder per HTTP-API (Agentenprofil auf anderes Modell umbinden):
+   # Or via HTTP API:
    curl -X POST http://127.0.0.1:8081/api/slots \
      -H "Content-Type: application/json" \
      -d '{"slot_id": "buddha_chat", "updates": {"model": "qwen3.8:27b-mlx", "backend": "ollama"}}'
    ```
+
+---
+
+<a id="sec-06"></a>
+## 06. Security, Invariants & Level 1 SBOM
+
+- **INV-LOCAL-01 (Zero Egress):** Pure local resource arbitration with zero external network dependencies or telemetry calls.
+- **INV-LOCAL-02 (Deterministic Turn Scheduling):** When both priorities have valid live tickets, the host preserves `next_foreground_streak`, and `legacy_foreground_pending` is false, the selector chooses a background ticket after at most three consecutive foreground selections. A legacy foreground hold returns no ticket. This is not a wall-clock or end-to-end starvation guarantee.
+- **INV-LOCAL-03 (Non-Privileged Execution):** Zero root or administrator privileges required; operates entirely in regular user space.
+- **Level 1 SBOM:**
+  - `setuptools >= 68.0` (Build system)
+  - `pytest` (Test runner)
+  - Python Standard Library (`dataclasses`, `typing`, `pathlib`, `json`, `os`, `sys`)
+  - License: MIT (SPDX compliant)
+
+---
+
+<a id="sec-07"></a>
+## 07. Installation & Test Execution
+
+```bash
+# 1. Clone the repository (Plan D canonical clone)
+git clone https://github.com/ellmos-ai/ocean-resources.git
+cd ocean-resources
+
+# 2. Run test suites and linters
+python -m pytest
+ruff check .
+python -m compileall .
+```
+
+---
+
+<a id="sec-08"></a>
+## 08. Governance & Contributing
+
+Contributions and issue reports are welcome. Please refer to our [Contributing Guide](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), and [Security Policy](SECURITY.md).

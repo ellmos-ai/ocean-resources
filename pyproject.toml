@@ -11,6 +11,20 @@ license = "MIT"
 requires-python = ">=3.11"
 authors = [{ name = "Lukas Geiger" }]
 dependencies = []
+keywords = [
+    "ram-distributor",
+    "resource-scheduler",
+    "llm-inference",
+    "model-runtime",
+    "offline-core",
+    "arbitration",
+    "ocean",
+    "bach",
+]
+
+[project.urls]
+Repository = "https://github.com/ellmos-ai/ocean-resources"
+Documentation = "https://github.com/ellmos-ai/ocean-resources#readme"
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -18,3 +32,4 @@ include = ["ocean_resources*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]

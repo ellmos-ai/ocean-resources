@@ -1,0 +1,78 @@
+# ocean-resources
+
+> Canonical RAM distributor, model runtime scheduler, torch arbiter, and watchdog hysteresis for BACH & Ocean.
+> Last-checked: 2026-11-04 | Version: 0.2.0
+
+## Overview
+
+`ocean-resources` is an offline-first Python module that provides decoupled host resource scheduling, physical memory/RAM distribution, and inference turn arbitration across local AI agents and external compute workloads (e.g. PyTorch, NemoFold, media processing).
+
+- **License**: MIT (SPDX: MIT)
+- **Runtime**: Python >= 3.11
+- **Repository**: https://github.com/ellmos-ai/ocean-resources
+- **Documentation**: https://github.com/ellmos-ai/ocean-resources#readme
+- **Architectural Reference**: Two-Stage Resource Claiming (Decision 2026-10-24, Issues #2441, #1949, #2027, #2028, #2152, #2308-#2311, #2334, #2419)
+
+## Architecture & Two-Stage Claiming
+
+1. **Stage 1: RAM Distribution (`ocean_resources.ram_distributor.RAMDistributor`)**
+   - Allocates the physical host RAM/VRAM "torch" among large consumers (e.g. 27B LLM vs scientific compute pipeline).
+   - Consumers declare `ConsumerCapability` (`weights_ram_bytes`, `kv_reserve_bytes`, `can_yield_at_turn_boundary`, `can_checkpoint`, `fallback_chain`).
+   - Tendency steering: `"ollama"` (AI agent priority) vs `"compute"` (background compute pipelines).
+   - Sensor hysteresis: `WatchdogHysteresisPolicy` protects cold-start model loads (90s grace window) while preserving emergency memory safeguards (<512 MiB floor).
+
+2. **Stage 2: Model Runtime & Turn Claiming (`ocean_resources.inference_queue_policy`)**
+   - Pure snapshot selection via `select_next_ticket`; the host owns queue state, validated target bindings, process coordination and dispatch.
+   - Conditional **3:1 selection rule** (`MAX_CONSECUTIVE_FOREGROUND = 3`): with both priorities live, a persisted foreground streak and no legacy foreground hold, choose background after three consecutive foreground selections. `legacy_foreground_pending=True` selects nothing. No wall-clock or end-to-end starvation guarantee.
+   - 4 UserProximity Classes:
+     - `UserProximity.DIRECT_INTERACTIVE = 1` (Interactive chat, voice PTT)
+     - `UserProximity.DELEGATED_FOREGROUND = 2` (Actively delegated user tasks)
+     - `UserProximity.SCHEDULED_ROUTINE = 3` (Scheduled calendar and routine tasks)
+     - `UserProximity.AUTONOMOUS_BACKGROUND = 4` (Continuous idle/autonomous processing)
+
+## Key Python Interfaces
+
+```python
+from ocean_resources import (
+    ConsumerCapability,
+    DistributorRequest,
+    RAMDistributor,
+    UserProximity,
+    WatchdogHysteresisPolicy,
+    QueueTicket,
+    select_next_ticket,
+)
+
+# 1. Initialize RAM Distributor
+dist = RAMDistributor(total_ram_bytes=32 * 1024**3, tendency="ollama")
+
+# 2. Register Consumer Capability
+dist.register_consumer(
+    ConsumerCapability(
+        consumer_id="qwen3.8-27b",
+        kind="model",
+        weights_ram_bytes=17 * 1024**3,
+        kv_reserve_bytes=3 * 1024**3,
+    )
+)
+
+# 3. Evaluate Resource Allocation Request
+decisions = dist.evaluate(
+    [DistributorRequest(
+        request_id="req-1",
+        consumer_id="qwen3.8-27b",
+        proximity=UserProximity.DIRECT_INTERACTIVE,
+        submitted_at=1.0,
+    )],
+    available_ram_bytes=24 * 1024**3,
+    pressure="normal",
+    now=2.0,
+)
+```
+
+## Invariants & Design Principles
+
+- **INV-LOCAL-01 (Zero Egress)**: Pure offline coordination; zero cloud dependencies, zero external network telemetries.
+- **INV-LOCAL-02 (Deterministic Queue Policy)**: Pure mathematical selection in `select_next_ticket`; reproducible FIFO + 3:1 ratio.
+- **INV-LOCAL-03 (Graceful Fallback Chain)**: Explicit fallback actions (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`).
+- **INV-LOCAL-04 (Zero-Privilege)**: Runs completely in user space without requiring elevated Windows/Linux administrator or root rights.

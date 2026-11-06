@@ -41,3 +41,47 @@ def test_standalone_ocean_resources_distributor() -> None:
     )
     res2 = dist.evaluate([req2], available_ram_bytes=9 * 1024**3, pressure="normal", now=4.0)
     assert res2[0].admitted is True
+
+
+def test_watchdog_hysteresis_policy() -> None:
+    policy = WatchdogHysteresisPolicy()
+
+    # 1. During cold start grace window, non-critical pressure does not evict
+    evict, reason = policy.should_evict_model(
+        available_ram_bytes=4 * 1024**3,
+        pressure="warning",
+        seconds_since_model_load=30.0,
+        sustained_critical_seconds=0.0,
+    )
+    assert evict is False
+    assert reason == "within_cold_start_grace_window"
+
+    # 2. Hard emergency floor breach under critical pressure evicts immediately
+    evict, reason = policy.should_evict_model(
+        available_ram_bytes=256 * 1024**2,
+        pressure="critical",
+        seconds_since_model_load=10.0,
+        sustained_critical_seconds=1.0,
+    )
+    assert evict is True
+    assert reason == "emergency_floor_breached_critical"
+
+    # 3. Sustained critical memory pressure evicts after threshold
+    evict, reason = policy.should_evict_model(
+        available_ram_bytes=2 * 1024**3,
+        pressure="critical",
+        seconds_since_model_load=120.0,
+        sustained_critical_seconds=16.0,
+    )
+    assert evict is True
+    assert reason == "sustained_critical_memory_pressure"
+
+    # 4. Normal operations stay within safe operating envelope
+    evict, reason = policy.should_evict_model(
+        available_ram_bytes=10 * 1024**3,
+        pressure="normal",
+        seconds_since_model_load=120.0,
+        sustained_critical_seconds=0.0,
+    )
+    assert evict is False
+    assert reason == "within_safe_operating_envelope"

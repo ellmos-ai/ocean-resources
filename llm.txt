@@ -1,0 +1,3 @@
+# llm.txt
+
+Please refer to [llms.txt](llms.txt) for the canonical LLM developer entrypoint, architectural invariants, and Python interfaces.
