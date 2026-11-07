@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (2026-11-08, PB-26)
+- `RunCooldownGate`, `RunCooldownPolicy` and `CooldownDecision` in `ram_distributor.py`: admission before each run of a local large consumer with the reasons `cooldown:swap` (swap-out rate above 32 MiB/min or memory pressure above normal), `cooldown:thermal` (`pmset -g therm` warning) and `cooldown:min` (60 s minimum pause). A failed probe drops only its own criterion, so unknown swap never blocks permanently.
+- `StressSample` and read-only `sample_stress()` in `host.py` (`vm_stat` Swapouts, `sysctl kern.memorystatus_vm_pressure_level`, `pmset -g therm`; no sudo, no writes).
+
 ### Corrected (2026-11-04)
 - Bound the runnable selector example to a validated model target and host-owned foreground streak.
 - Limit fairness claims to validated live snapshots, carried host state and no legacy foreground hold; label diagrams as target integration rather than verified dispatch.
