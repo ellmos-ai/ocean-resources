@@ -103,6 +103,58 @@ def parse_macos_vm(text: str) -> int:
     return sum(pages) * page_size
 
 
+@dataclass(frozen=True)
+class StressSample:
+    """Read-only stress signals for run admission (PB-26); None means not measured."""
+
+    observed_at: float  # time.monotonic() of this host; only used for rates between two samples
+    swapouts_bytes: int | None = None  # cumulative vm_stat "Swapouts" x page size (SSD writes)
+    pressure_level: int | None = None  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
+    thermal_warning: bool | None = None  # pmset -g therm
+
+
+def parse_swapouts(text: str) -> int:
+    page = re.search(r"page size of (\d+) bytes", text)
+    item = re.search(r"^Swapouts:\s+(\d+)\.?\s*$", text, re.MULTILINE)
+    if not page or not item or int(page[1]) not in {4096, 16384, 65536}:
+        raise ValueError("vm_stat without verified Swapouts")
+    return int(item[1]) * int(page[1])
+
+
+def parse_thermal_warning(text: str) -> bool:
+    """pmset -g therm: a warning level above 0 or a CPU limit below 100 is a warning."""
+    levels = re.findall(r"warning level\s*(?:=|:|set to)\s*(\d+)", text, re.IGNORECASE)
+    limits = re.findall(r"CPU_(?:Speed|Scheduler)_Limit\s*=\s*(\d+)", text)
+    if not levels and not limits and "No thermal warning level has been recorded" not in text:
+        raise ValueError("unrecognised pmset output")
+    return any(int(v) > 0 for v in levels) or any(int(v) < 100 for v in limits)
+
+
+def _pressure_level() -> int:
+    level = int(_command(["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"]).strip())
+    if level not in {1, 2, 4}:
+        raise ValueError("unknown pressure level")
+    return level
+
+
+def sample_stress() -> StressSample:
+    """vm_stat, sysctl and pmset only (no sudo, no writes); each failed probe stays None."""
+    now = time.monotonic()
+    if platform.system() != "Darwin":
+        return StressSample(now)
+    values = []
+    for probe in (
+        lambda: parse_swapouts(_command(["/usr/bin/vm_stat"])),
+        _pressure_level,
+        lambda: parse_thermal_warning(_command(["/usr/bin/pmset", "-g", "therm"])),
+    ):
+        try:
+            values.append(probe())
+        except (OSError, ValueError, subprocess.SubprocessError):
+            values.append(None)
+    return StressSample(now, *values)
+
+
 def _windows_memory() -> tuple[int, int]:
     class MemoryStatus(ctypes.Structure):
         _fields_ = [

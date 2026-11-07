@@ -12,6 +12,8 @@ Setzt das präzisierte Konzept vom 24.10.2026 (#1949, #2027, #2028, #2152, #2334
 4. Deterministische Fallbacks für Verlierer (`FallbackDecision`)
 5. Hysterese-Schutz gegen Watchdog-Fehlalarme beim 27B-Kaltstart (#2419, Rückbau
    der `free_emergency_pages=0`-Zwischenlösung)
+6. Abkühlzulassung vor jedem Lauf eines lokalen Großverbrauchers (`RunCooldownGate`,
+   PB-26): Swap-Schreibrate und Speicherdruck, Wärmewarnung, Mindestpause
 """
 
 from __future__ import annotations
@@ -21,6 +23,7 @@ from enum import IntEnum
 from typing import Any, Optional
 
 from .contracts import Hold, identity, instant, positive
+from .host import StressSample, sample_stress  # noqa: F401 -- consumers load only this module
 
 
 class UserProximity(IntEnum):
@@ -125,6 +128,68 @@ class WatchdogHysteresisPolicy:
         if pressure == "critical" and sustained_critical_seconds >= self.sustained_pressure_seconds:
             return True, "sustained_critical_memory_pressure"
         return False, "within_safe_operating_envelope"
+
+
+@dataclass(frozen=True)
+class RunCooldownPolicy:
+    """Abkühlzulassung vor jedem Lauf eines lokalen Großverbrauchers (PB-26, Lukas 08.11.2026).
+
+    Hauptkriterium ist der Swap, weil er die nicht tauschbare SSD des Mac Studio
+    verschleißt (2,9 TB Schreibmenge in 45 h). Die Druckstufe allein erkennt das
+    nicht: Am 08.11. 00:43 meldete sie 1 (normal) bei ~198 MiB/min Swapouts.
+    """
+
+    min_pause_seconds: float = 60.0  # Zwangspause nach jedem Lauf
+    # ponytail: fixed threshold, ~46 GB/day if sustained (1/6 of the 08.11. measurement);
+    # recalibrate here once the cooldowns on the Mac are observed.
+    max_swapout_mib_per_minute: float = 32.0
+    max_pressure_level: int = 1  # kern.memorystatus_vm_pressure_level: 2 = warn, 4 = critical
+    unload_after_seconds: float = 300.0  # so lange Abkühlung -> Modell einmal entladen
+
+
+@dataclass(frozen=True)
+class CooldownDecision:
+    admitted: bool
+    reason: str  # "admitted" | "cooldown:swap" | "cooldown:thermal" | "cooldown:min"
+    swapout_mib_per_minute: Optional[float] = None
+
+
+def swapout_mib_per_minute(previous: Optional[StressSample], current: Optional[StressSample]) -> Optional[float]:
+    """Swap-Schreibrate zwischen zwei Messungen; None ohne Zähler, bei Reset oder Fenster < 1 s."""
+    if previous is None or current is None or None in (previous.swapouts_bytes, current.swapouts_bytes):
+        return None
+    seconds = current.observed_at - previous.observed_at
+    delta = current.swapouts_bytes - previous.swapouts_bytes
+    if seconds < 1 or delta < 0:
+        return None
+    return delta / 1024**2 / seconds * 60
+
+
+@dataclass
+class RunCooldownGate:
+    """Eine Pause: Basismessung am Laufende, danach eine Zulassungsfrage je Abfrage.
+
+    Fehlt eine Messung, entfällt nur ihr Kriterium; die Mindestpause bleibt. So wird
+    unbekannter Swap nie zum Dauerstopp.
+    """
+
+    baseline: Optional[StressSample] = None
+    policy: RunCooldownPolicy = field(default_factory=RunCooldownPolicy)
+
+    def check(self, sample: Optional[StressSample], *, seconds_since_run_end: float) -> CooldownDecision:
+        rate = swapout_mib_per_minute(self.baseline, sample)
+        if sample is not None and sample.swapouts_bytes is not None:
+            self.baseline = sample  # ponytail: one quiet poll admits, add hysteresis if it flaps
+        policy = self.policy
+        level = sample.pressure_level if sample is not None else None
+        if ((rate is not None and rate > policy.max_swapout_mib_per_minute)
+                or (level is not None and level > policy.max_pressure_level)):
+            return CooldownDecision(False, "cooldown:swap", rate)
+        if sample is not None and sample.thermal_warning:
+            return CooldownDecision(False, "cooldown:thermal", rate)
+        if seconds_since_run_end < policy.min_pause_seconds:
+            return CooldownDecision(False, "cooldown:min", rate)
+        return CooldownDecision(True, "admitted", rate)
 
 
 @dataclass(frozen=True)

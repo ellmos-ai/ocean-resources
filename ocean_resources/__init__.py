@@ -8,15 +8,18 @@ from .contracts import (
     CapacityReadback, Checkpoint, ExitReadback, Grant, Hold, HybridPlannerPointer,
     Override, ResourceSocket, SlotRequest,
 )
-from .host import HostObservation, sample_host
+from .host import HostObservation, StressSample, sample_host, sample_stress
 from .pipelines import PipelineDefinition, ResourceBudget, load_catalog, route_job, shadow_plan, slot_request
 from .client import HostClient
 from .service import HostService
 from .ram_distributor import (
     ConsumerCapability,
+    CooldownDecision,
     DistributorRequest,
     FallbackDecision,
     RAMDistributor,
+    RunCooldownGate,
+    RunCooldownPolicy,
     UserProximity,
     WatchdogHysteresisPolicy,
 )
@@ -35,13 +38,14 @@ __all__ = [
     "ExitReadback", "Grant", "Hold", "HostLocalArbiter", "HostWriterAuthority",
     "HybridPlannerPointer", "ModelSocketBinding", "ModelSocketInferenceAdapter",
     "Override", "ResourceSocket", "SlotRequest",
-    "HostObservation", "sample_host", "PipelineDefinition", "ResourceBudget",
+    "HostObservation", "StressSample", "sample_host", "sample_stress", "PipelineDefinition", "ResourceBudget",
     "load_catalog", "route_job", "shadow_plan", "slot_request",
     "ControllerClient", "FocusPolicy", "HostController", "OverrideCommand",
     "ProfileSource", "ReviewedProfileGate",
     "HostClient", "HostService",
     "ConsumerCapability", "DistributorRequest", "FallbackDecision",
     "RAMDistributor", "UserProximity", "WatchdogHysteresisPolicy",
+    "CooldownDecision", "RunCooldownGate", "RunCooldownPolicy",
     "MAX_CONSECUTIVE_FOREGROUND", "QueuePolicyError", "QueuePriority",
     "QueueSelection", "QueueTicket", "SelectionReason", "select_next_ticket",
 ]
