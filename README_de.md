@@ -1,10 +1,11 @@
 # ocean-resources — RAM-Distributor & Modell-Runtime-Scheduler
 
 [![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue.svg)](pyproject.toml)
+[![CI](https://github.com/ellmos-ai/ocean-resources/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests: Passing](https://img.shields.io/badge/tests-17%2F17%20passing%20%7C%20100%25%20green-success.svg)](tests/)
-[![Verified: 2026-11-04](https://img.shields.io/badge/verified-2026--11--04-brightgreen.svg)](_reg/hosts/WORKSTATION-LG/CHECK-REG.txt)
+[![Tests: Passing](https://img.shields.io/badge/tests-32%2F32%20passing%20%7C%20100%25%20green-success.svg)](tests/)
+[![Verified: 2026-11-14](https://img.shields.io/badge/verified-2026--11--14-brightgreen.svg)](tests/test_metadata.py)
 [![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
 > **Sprachen / Languages:** [Deutsch](README_de.md) | [English](README.md)
@@ -38,7 +39,7 @@ Einheitliche Koordination von physischem Host-Arbeitsspeicher (RAM/VRAM), dynami
 ---
 
 <a id="sec-02"></a>
-## 02. SOLL-Stand vs. IST-Stand (Stand 04.11.2026)
+## 02. SOLL-Stand vs. IST-Stand (Stand 14.11.2026)
 
 | Bereich | SOLL-Stand (Zielarchitektur) | Belegter IST-Stand |
 |---|---|---|
@@ -247,10 +248,24 @@ sequenceDiagram
 git clone https://github.com/ellmos-ai/ocean-resources.git
 cd ocean-resources
 
-# 2. Entwicklungsumgebung & Tests ausführen
+# 2. Paket im Entwicklungsmodus in isolierter Umgebung (.venv) installieren
+python -m venv .venv
+python -m pip install -e ".[dev]"
+
+# 3. Testsuite, Linter und Offline-CLI-Prüfung ausführen
 python -m pytest
 ruff check .
-python -m compileall .
+python -m compileall -q ocean_resources tests
+python -m ocean_resources manifest
+```
+
+### Mit deinem LLM installieren / Install with your LLM
+
+```text
+Installiere und verifiziere https://github.com/ellmos-ai/ocean-resources (Release-Tag/Commit-Pin bevorzugen, keine ungeprüften curl|sh-Pipes):
+1. Lies zuerst llms.txt und SKILL.md im Repo-Root.
+2. Erstelle eine isolierte Umgebung (.venv) und führe den Installationsbefehl aus llms.txt aus.
+3. Prüfe die Installation mit dem Verifikationsbefehl (python -m pytest && python -m ocean_resources manifest) und berichte das Ergebnis.
 ```
 
 ---
