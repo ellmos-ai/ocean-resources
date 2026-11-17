@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from functools import wraps
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -162,6 +163,21 @@ class HostLocalArbiter:
         self._override = override
         self._events.append({"event": "override", "value": asdict(override) if override else None})
 
+    @serialized
+    def cancel_waiting(self, request_id: str):
+        """Remove only unstarted work; retain identity tombstones for replay."""
+        self._require()
+        identity(request_id)
+        if self._active is not None and self._active.grant.request_id == request_id:
+            raise Hold("active execution requires the checkpoint and exit protocol")
+        if request_id not in self._requests:
+            raise Hold("unknown request")
+        if request_id in self._pending:
+            self._pending.remove(request_id)
+            self._events.append({"event": "waiting-cancelled", "request_id": request_id})
+        if self._override is not None and self._override.request_id == request_id:
+            self._override = None
+
     def _select(self) -> str:
         if not self._pending:
             raise Hold("no waiting slot")
@@ -253,6 +269,59 @@ class HostLocalArbiter:
             raise Hold("execution identity cannot change")
         active.execution_identity = execution_identity
         self.authority.record(asdict(active))
+
+    @serialized
+    def record_model_evidence(self, grant, execution_id, workload_sha256, model, digest,
+                              phase, checkpoint_path=None, checkpoint_sha256=None):
+        """Persist the model identity and accepted checkpoint before native handoff."""
+        active = self._current(grant)
+        sha256_hex(workload_sha256)
+        sha256_hex(digest)
+        if (active.execution_identity != execution_id or phase not in {"admitted", "checkpointed"}
+                or not isinstance(model, str) or not 1 <= len(model) <= 192):
+            raise Hold("invalid durable model identity")
+        evidence = {"schema": "ocean-model-execution.v1", "grant": asdict(grant),
+                    "execution_identity": execution_id, "workload_sha256": workload_sha256,
+                    "model": model, "digest": digest, "phase": phase,
+                    "checkpoint_path": checkpoint_path, "checkpoint_sha256": checkpoint_sha256}
+        if phase == "admitted":
+            if checkpoint_path is not None or checkpoint_sha256 is not None or active.execution_evidence is not None:
+                raise Hold("model admission evidence already exists")
+        else:
+            previous = active.execution_evidence
+            if previous is None or any(previous[k] != evidence[k] for k in
+                    ("schema", "grant", "execution_identity", "workload_sha256", "model", "digest")):
+                raise Hold("model checkpoint belongs to a different execution")
+            path = Path(checkpoint_path)
+            sha256_hex(checkpoint_sha256)
+            if (not path.is_absolute() or path.is_symlink() or path.resolve() != path
+                    or path.stat().st_size > 1024 * 1024
+                    or hashlib.sha256(path.read_bytes()).hexdigest() != checkpoint_sha256):
+                raise Hold("durable model checkpoint is unavailable or changed")
+        previous = active.execution_evidence
+        active.execution_evidence = evidence
+        try:
+            self.authority.record(asdict(active))
+        except BaseException:
+            active.execution_evidence = previous
+            raise
+
+    @serialized
+    def require_model_evidence(self, grant, execution_id, workload_sha256, model, digest, *, phase=None):
+        active = self._current(grant)
+        evidence = active.execution_evidence
+        saved = self.authority.unresolved()
+        if (not isinstance(evidence, dict) or not isinstance(saved, dict)
+                or evidence.get("schema") != "ocean-model-execution.v1"
+                or evidence.get("grant") != asdict(grant)
+                or evidence.get("execution_identity") != execution_id
+                or evidence.get("workload_sha256") != workload_sha256
+                or evidence.get("model") != model or evidence.get("digest") != digest
+                or saved.get("grant") != asdict(grant)
+                or saved.get("execution_evidence") != evidence
+                or phase is not None and evidence.get("phase") != phase):
+            raise Hold("exact model execution is not durably owned")
+        return deepcopy(evidence)
 
     @serialized
     def record_execution_evidence(self, grant: Grant, evidence: dict):

@@ -14,6 +14,7 @@ from threading import Lock, RLock
 
 from .adapters import BACHFacade
 from .contracts import Grant, Hold, Override, SlotRequest, identity, instant
+from .client_leases import ClientLeaseLifecycle
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ class ControllerClient:
     operator: bool = False
     allow_interactive: bool = False
     priority_floor: int = 1
+    require_leases: bool = False
 
     def __post_init__(self):
         identity(self.client_id)
@@ -44,7 +46,7 @@ class ControllerClient:
             identity(name)
         if not isinstance(self.token, str) or not 32 <= len(self.token) <= 128 or not self.token.isascii():
             raise ValueError("bounded private ASCII client token required")
-        if type(self.operator) is not bool or type(self.allow_interactive) is not bool:
+        if any(type(value) is not bool for value in (self.operator, self.allow_interactive, self.require_leases)):
             raise ValueError("explicit boolean client permissions required")
         if type(self.priority_floor) is not int or not 1 <= self.priority_floor <= 4:
             raise ValueError("client priority floor must be P1..P4")
@@ -92,7 +94,7 @@ class ControllerAudit:
             os.fsync(stream.fileno())
 
 
-class HostController:
+class HostController(ClientLeaseLifecycle):
     """Single host-loop controller. Callbacks run outside its state mutex.
 
     Tokens authorize configured local clients, not arbitrary code in this Python
@@ -116,6 +118,7 @@ class HostController:
         self._authority_id = self.arbiter.authority.authority_id
         self._clients = {c.client_id: c for c in clients}
         self._owners: dict[str, str] = {}
+        self._leases: dict[str, dict] = {}
         self._commands: dict[str, tuple[str, OverrideCommand]] = {}
         self._mutex, self._transition_lock = RLock(), Lock()
         self._active: Grant | None = None
@@ -170,6 +173,11 @@ class HostController:
 
     def submit(self, client_id: str, token: str, request: SlotRequest) -> str:
         client = self._authenticate(client_id, token)
+        if client.require_leases:
+            raise Hold("this client requires an explicit bounded request lease")
+        return self._submit(client, request)
+
+    def _submit(self, client, request):
         with self._mutex:
             if self._audit_fault:
                 raise Hold("controller audit unavailable")
@@ -180,9 +188,9 @@ class HostController:
             if old is not None and old != client.client_id:
                 raise Hold("request belongs to another native client")
             if old is None:
-                self._audit("submit-requested", client_id=client_id, request_id=request.request_id)
+                self._audit("submit-requested", client_id=client.client_id, request_id=request.request_id)
             result = self.arbiter.submit(request)
-            self._owners[request.request_id] = client_id
+            self._owners[request.request_id] = client.client_id
             return result
 
     def begin_turn(self, client_id, token, grant: Grant, turn_id: str):
@@ -191,6 +199,9 @@ class HostController:
         with self._mutex:
             request = self._owned(client, grant)
             self.arbiter.require_running(grant)
+            entry = self._leases.get(grant.request_id)
+            if entry is not None and (entry["terminal"] or self._now() >= entry["receipt"].expires_at):
+                raise Hold("client lease expired; existing turns may still settle")
             if self._audit_fault:
                 raise Hold("controller audit unavailable")
             if turn_id in self._turns:
@@ -278,6 +289,7 @@ class HostController:
         try:
             with self._mutex:
                 now = self._now()
+                self._expire_leases(now)
                 state = self.arbiter.status()
                 if state["torch"] != (asdict(self._active) if self._active else None):
                     raise Hold("unowned or failed-start torch; original execution reconciliation required")
@@ -325,6 +337,9 @@ class HostController:
                     if self._active != grant:
                         raise Hold("controller grant changed during handoff")
                     self._active, self._return, self._transition = None, None, None
+                    if not requeue and grant.request_id in self._leases:
+                        entry = self._leases[grant.request_id]
+                        entry["terminal"] = entry["terminal"] or "FINISHED"
                     self._turns.clear()
                     self._ended_turns.clear()
                     self._audit("released", grant=asdict(grant), requeued=requeue)

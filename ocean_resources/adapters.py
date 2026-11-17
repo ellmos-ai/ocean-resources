@@ -51,8 +51,9 @@ class ModelSocketBinding:
 
 class ModelSocketInferenceAdapter:
     """Wraps the existing async gate.turn contract, without renaming it."""
-    def __init__(self, arbiter: HostLocalArbiter, binding: ModelSocketBinding, gate):
+    def __init__(self, arbiter: HostLocalArbiter, binding: ModelSocketBinding, gate, *, workload_sha256=None):
         self._arbiter, self.binding, self._gate = arbiter, binding, gate
+        self._workload_sha256 = workload_sha256
 
     @asynccontextmanager
     async def turn(self, grant: Grant, chat_id: str):
@@ -60,7 +61,7 @@ class ModelSocketInferenceAdapter:
         if grant.socket_id != self.binding.socket_id:
             raise Hold("model binding belongs to another resource socket")
         # A CPU process measurement cannot authorize an external model daemon.
-        self._arbiter.require_workload(grant, None, kind="model-api")
+        self._arbiter.require_workload(grant, self._workload_sha256, kind="model-api")
         self._arbiter.require_running(grant)
         async with self._gate.turn(
             chat_id,
