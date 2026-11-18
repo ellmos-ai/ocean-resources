@@ -2,8 +2,8 @@
 
 The configured file pins are the approval boundary, not a JSON boolean. Sampled
 resource observations are evidence for a reviewed allocation, not a kernel limit
-or a proof of worst-case RSS/CPU. This first native scope is CPU-owned processes;
-model/GPU/external-daemon residency needs a different independently proved scope.
+or a proof of worst-case RSS/CPU. CPU-owned processes and exact Ollama model API
+targets use different measurement scopes; neither admits arbitrary GPU daemons.
 """
 from __future__ import annotations
 
@@ -118,6 +118,11 @@ class ReviewedProfileGate:
                             "workload_sha256", "ram_bytes", "cpu_units", "ram_margin_bytes", "evidence_sha256",
                             "approved_by", "approved_at", "expires_at"}:
             raise ValueError("exact reviewed workload profile fields required")
+        if profile["kind"] == "model-api":
+            from .model_profiles import validate_model_profile
+            evidence = _document(source.evidence_path, profile["evidence_sha256"], 4 * 1024 * 1024)
+            return validate_model_profile(profile, evidence, host=self._host, system=self._platform,
+                architecture=self._architecture, now=self._clock(), max_age=self._max_age)
         if profile["schema"] != "ocean-reviewed-workload-profile.v1" or profile["kind"] != "cpu-owned-process":
             raise ValueError("unsupported workload profile scope")
         for key in ("profile_id", "socket_id", "host_id", "approved_by"):

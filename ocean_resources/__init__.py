@@ -6,7 +6,7 @@ from .profiles import ProfileSource, ReviewedProfileGate
 from .controller import ControllerClient, FocusPolicy, HostController, OverrideCommand
 from .contracts import (
     CapacityReadback, Checkpoint, ExitReadback, Grant, Hold, HybridPlannerPointer,
-    Override, ResourceSocket, SlotRequest,
+    Override, RequestLease, ResourceSocket, SlotRequest,
 )
 from .host import HostObservation, StressSample, sample_host, sample_stress
 from .pipelines import PipelineDefinition, ResourceBudget, load_catalog, route_job, shadow_plan, slot_request
@@ -37,7 +37,7 @@ __all__ = [
     "BACHFacade", "CapacityReadback", "Checkpoint", "ComputeExecutorAdapter",
     "ExitReadback", "Grant", "Hold", "HostLocalArbiter", "HostWriterAuthority",
     "HybridPlannerPointer", "ModelSocketBinding", "ModelSocketInferenceAdapter",
-    "Override", "ResourceSocket", "SlotRequest",
+    "Override", "RequestLease", "ResourceSocket", "SlotRequest",
     "HostObservation", "StressSample", "sample_host", "sample_stress", "PipelineDefinition", "ResourceBudget",
     "load_catalog", "route_job", "shadow_plan", "slot_request",
     "ControllerClient", "FocusPolicy", "HostController", "OverrideCommand",

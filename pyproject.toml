@@ -22,6 +22,12 @@ keywords = [
     "bach",
 ]
 
+[project.optional-dependencies]
+native = ["psutil>=5.9.6,<8"]
+
+[project.scripts]
+ocean-resource-client = "ocean_resources.client_cli:main"
+
 [project.urls]
 Repository = "https://github.com/ellmos-ai/ocean-resources"
 Documentation = "https://github.com/ellmos-ai/ocean-resources#readme"
@@ -29,6 +35,9 @@ Documentation = "https://github.com/ellmos-ai/ocean-resources#readme"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["ocean_resources*"]
+
+[tool.setuptools.package-data]
+ocean_resources = ["*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
