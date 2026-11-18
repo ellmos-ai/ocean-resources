@@ -184,4 +184,3 @@ def active_process_count(job: int) -> int:
     if not api.QueryInformationJobObject(job, 1, ctypes.byref(value), ctypes.sizeof(value), None):
         raise _fail("Aktive Prozesse im eigenen Job nicht prüfbar")
     return int(value.active)
-

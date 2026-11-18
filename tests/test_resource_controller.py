@@ -403,4 +403,3 @@ def test_real_owned_process_automatic_handoff_and_checkpoint_resume(tmp_path):
             assert all(run.exited and run.child.poll() is not None for run in executor._executions.values())
         finally:
             executor.close()
-

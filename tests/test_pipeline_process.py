@@ -449,4 +449,3 @@ with HostWriterAuthority(state.resolve(), "owned-test-host") as writer:
         capture_output=True, text=True, timeout=15, check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-
