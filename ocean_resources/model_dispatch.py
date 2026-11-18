@@ -97,8 +97,9 @@ def _read_current(reference):
                 or hashlib.sha256(envelope["payload"].encode()).hexdigest() != envelope["sha256"]):
             raise Hold("native model writer journal is torn or invalid")
         payload = _document(envelope["payload"])
-        if (not isinstance(payload, dict) or set(payload) != {"authority_id", "unresolved"}
+        if (not isinstance(payload, dict) or set(payload) != {"authority_id", "unresolved", "writer_active"}
                 or payload["authority_id"] != reference["authority_id"]
+                or payload["writer_active"] is not True
                 or not isinstance(payload["unresolved"], dict)):
             raise Hold("native model reservation is no longer present")
         same_inode()

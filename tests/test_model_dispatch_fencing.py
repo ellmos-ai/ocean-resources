@@ -58,6 +58,7 @@ def test_cached_permit_cannot_survive_lost_native_proof(pending_host, change):
     ctl, client, operator, _arbiter, _port, _free, now, writer, _sensor = pending_host
     lease, grant, permit = pending_permit(pending_host)
     check(pending_host, permit)
+    restore = None
     if change in {"abort", "release"}:
         ctl.complete_model_load(client.client_id, client.token, grant, "attempt", False)
         if change == "release":
@@ -74,18 +75,32 @@ def test_cached_permit_cannot_survive_lost_native_proof(pending_host, change):
     elif change == "inode":
         path = Path(permit["writer_readback"]["path"])
         content = path.read_bytes()
-        path.unlink()
+        displaced = path.with_suffix(".displaced")
+        path.rename(displaced)
         path.write_bytes(content)
         path.chmod(0o600)
+        def restore():
+            path.unlink()
+            displaced.rename(path)
     elif change == "torn":
-        Path(permit["writer_readback"]["path"]).write_bytes(b'0{"payload":')
+        path = Path(permit["writer_readback"]["path"])
+        content = path.read_bytes()
+        path.write_bytes(b'0{"payload":')
+        def restore():
+            path.write_bytes(content)
     elif change == "unlocked":
         writer.__exit__()
     else:
         key = "created_at" if change == "writer_birth" else "boot_time"
         permit["writer_readback"]["writer"][key] += 1
-    with pytest.raises(Hold):
-        check(pending_host, permit)
+    try:
+        with pytest.raises(Hold):
+            check(pending_host, permit)
+    finally:
+        # Only restore our intentionally damaged fixture after the assertion;
+        # native close now requires durable epoch retirement on the same inode.
+        if restore is not None:
+            restore()
 
 
 @posix_reader
@@ -99,6 +114,99 @@ def test_new_writer_same_process_and_inode_never_revives_old_journal(pending_hos
         assert replacement.authority_id != permit["writer_readback"]["authority_id"]
         with pytest.raises(Hold):
             check(pending_host, permit)
+
+
+@posix_reader
+def test_closed_epoch_is_retired_before_same_process_can_reopen_inode(pending_host, monkeypatch):
+    *_prefix, writer, _sensor = pending_host
+    _lease,_grant,permit=pending_permit(pending_host)
+    check(pending_host, permit)
+    ordinary_restore=HostWriterAuthority.unresolved
+    test_observation=[]
+    writer.__exit__()
+    def probe_during_native_restore(replacement):
+        if replacement is not writer and not test_observation:
+            try:
+                check(pending_host, permit)
+            except Hold:
+                test_observation.append("old permit held")
+            else:
+                test_observation.append("old permit accepted")
+        return ordinary_restore(replacement)
+    monkeypatch.setattr(HostWriterAuthority,"unresolved",probe_during_native_restore)
+    with HostWriterAuthority(writer.directory,writer.host_id):
+        assert test_observation == ["old permit held"]
+
+
+@pytest.mark.parametrize("failure", ["write", "fsync"])
+@posix_reader
+def test_retirement_io_failure_keeps_native_lock_and_unresolved(pending_host, monkeypatch, failure):
+    *_prefix, writer, _sensor = pending_host
+    _lease, _grant, permit = pending_permit(pending_host)
+    before = deepcopy(writer.unresolved())
+    def unavailable(*_args):
+        raise OSError("fixture retirement persistence unavailable")
+    with monkeypatch.context() as patch:
+        if failure == "write":
+            patch.setattr(writer, "record", unavailable)
+        else:
+            patch.setattr(os, "fsync", unavailable)
+        with pytest.raises(Hold, match="native lock retained"):
+            writer.__exit__()
+        assert writer.held
+        assert writer.unresolved() == before
+        with pytest.raises(Hold, match="retired"):
+            writer.require()
+        with pytest.raises(Hold, match="exclusively acquired"):
+            HostWriterAuthority(writer.directory, writer.host_id).__enter__()
+    writer.__exit__()
+    with HostWriterAuthority(writer.directory, writer.host_id) as replacement:
+        assert replacement.unresolved() == before
+        with pytest.raises(Hold):
+            check(pending_host, permit)
+
+
+@posix_reader
+def test_failed_retirement_cannot_release_native_lock_via_garbage_collection(tmp_path, monkeypatch):
+    import gc
+    import weakref
+    writer = HostWriterAuthority(tmp_path.resolve(), "retirement-fixture").__enter__()
+    writer.record({"unresolved_fixture": True})
+    reference = weakref.ref(writer)
+    with monkeypatch.context() as patch:
+        def unavailable(_descriptor):
+            raise OSError("fixture fsync unavailable")
+        patch.setattr(os, "fsync", unavailable)
+        with pytest.raises(Hold, match="native lock retained"):
+            writer.__exit__()
+    del writer
+    gc.collect()
+    assert reference() is not None
+    try:
+        with pytest.raises(Hold, match="exclusively acquired"):
+            HostWriterAuthority(tmp_path.resolve(), "retirement-fixture").__enter__()
+        assert reference().unresolved() == {"unresolved_fixture": True}
+    finally:
+        reference().__exit__()
+
+
+@pytest.mark.parametrize("legacy_epoch", [False, True])
+def test_legacy_ordinary_journal_preserves_unresolved_on_upgrade(tmp_path, legacy_epoch):
+    import hashlib
+    import json
+    unresolved = {"request_id": "legacy-owned-work", "checkpoint_evidence": None,
+                  "reserved_ram_bytes": GIB, "unknown_release": True}
+    document = {"unresolved": unresolved}
+    if legacy_epoch:
+        document["authority_id"] = "legacy-writer"
+    payload = json.dumps(document, sort_keys=True, separators=(",", ":"))
+    path = tmp_path / "legacy-host.writer"
+    path.write_bytes(b"0" + json.dumps({"payload": payload,
+        "sha256": hashlib.sha256(payload.encode()).hexdigest()}).encode())
+    path.chmod(0o600)
+    for _ in range(2):
+        with HostWriterAuthority(tmp_path.resolve(), "legacy-host") as writer:
+            assert writer.unresolved() == unresolved
 
 
 @pytest.mark.parametrize("change", ["cancel", "writer_reopen"])

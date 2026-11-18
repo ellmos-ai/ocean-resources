@@ -54,11 +54,23 @@ grant/request/turn/execution, current client lease, full profile and policy.
 Profile/evidence files are revalidated and the journal is read again after that
 potentially slow work. Torn, replaced, unlocked, stale or terminal records close
 the path. Client cancellation and pending host heartbeats are journaled before
-acknowledgement. A close/reopen in the same PID stamps a new writer epoch while
-preserving unresolved reservations; it cannot revive an old permit.
+acknowledgement. Closing a writer durably retires its epoch before releasing its
+native lock, preserving unresolved reservations. Retirement I/O failure retains
+the native lock and refuses further writer work until an explicit successful
+close retry or process exit. A close/reopen in the same PID cannot revive an old
+permit, including the interval before the replacement publishes its new epoch.
 The native reader currently supports POSIX inode/flock semantics; a Windows
 staged caller remains closed until an equivalent reviewed native reader exists.
 This does not change ordinary Windows compute grants.
+
+The `writer_active` journal field is also written for ordinary, nonstaged work.
+The new authority can read both earlier journal forms (`unresolved` alone or
+with `authority_id`) and preserves their unresolved reservation on upgrade.
+Those older forms never authorize staged dispatch. Older package versions may
+reject the new schema: downgrading a running authority requires an independently
+verified journal/lifecycle transition that preserves every unresolved grant and
+execution. Do not silently strip epoch fields, clear the journal or release its
+native lock to make a downgrade start.
 
 Controller selection pins the expected request in both ordinary and staged
 admission. A concurrent higher-priority arrival must be selected anew rather than
