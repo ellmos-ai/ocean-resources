@@ -16,6 +16,7 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
     lease = grant = None
     submitted = False
     turn_attempted = turn_started = False
+    begin_call = None
     turn_id = uuid.uuid4().hex
     renewal = None
     deadline = time.monotonic() + wait_seconds
@@ -67,7 +68,10 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
         if check_ready is not None:
             check_ready()
         turn_attempted = True
-        await asyncio.to_thread(client.begin_turn, grant, turn_id)
+        # Cancelling the coroutine cannot cancel an already running HTTP thread.
+        # Keep its task alive so cleanup can join it, then settle the same ID.
+        begin_call = asyncio.create_task(asyncio.to_thread(client.begin_turn, grant, turn_id))
+        await asyncio.shield(begin_call)
         turn_started = True
 
         async def heartbeat():
@@ -79,21 +83,53 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
         # Caller still owns all normal reserve/cold-start/task/budget checks.
         yield {"grant": asdict(grant), "lease": asdict(lease), "renewal": renewal}
     finally:
-        if renewal is not None:
-            renewal.cancel()
+        async def settle():
+            nonlocal turn_started
+            if renewal is not None:
+                renewal.cancel()
+                try:
+                    await renewal
+                except (asyncio.CancelledError, Hold):
+                    pass
+            if turn_attempted:
+                try:
+                    if begin_call is not None:
+                        await asyncio.shield(begin_call)
+                        turn_started = True
+                except Hold:
+                    pass  # A rejected or uncertain begin still needs terminal end.
+                finally:
+                    # Even a repeated cancellation while joining cannot skip the
+                    # terminal request. Server tombstones fence transport reordering.
+                    for attempt in range(2):
+                        try:
+                            await asyncio.shield(asyncio.to_thread(client.end_turn, grant, turn_id))
+                            break
+                        except Hold:
+                            try:
+                                current = await asyncio.to_thread(client.request_status, grant.request_id)
+                                if current["grant"] is None and current["state"] in {"FINISHED", "CANCELLED", "EXPIRED"}:
+                                    break  # The same owned request has already been released natively.
+                            except Hold:
+                                pass
+                            if attempt and turn_started:
+                                raise  # Explicit uncertainty; never claim RAM was freed.
+            elif lease is not None and submitted:
+                current = await asyncio.to_thread(client.request_status, lease.request_id)
+                await asyncio.shield(asyncio.to_thread(client.cancel, RequestLease(**current["lease"])))
+
+        # Shield the entire finite transport cleanup, retaining it even across
+        # repeated caller cancellations. The caller sees cancellation only after
+        # its turn is terminal or cleanup reports an explicit HOLD.
+        cleanup = asyncio.create_task(settle())
+        cancelled_during_cleanup = False
+        while True:
             try:
-                await renewal
-            except (asyncio.CancelledError, Hold):
-                pass
-        if turn_attempted:
-            # Also settle a possibly applied begin_turn after a lost response.
-            try:
-                await asyncio.shield(asyncio.to_thread(client.end_turn, grant, turn_id))
-            except Hold:
-                if turn_started:
+                await asyncio.shield(cleanup)
+                break
+            except asyncio.CancelledError:
+                if cleanup.cancelled():
                     raise
-                # Preserve the original failed/uncertain begin response. The
-                # controller retains unresolved turns; no client claims release.
-        elif lease is not None and submitted:
-            current = await asyncio.to_thread(client.request_status, lease.request_id)
-            await asyncio.shield(asyncio.to_thread(client.cancel, RequestLease(**current["lease"])))
+                cancelled_during_cleanup = True
+        if cancelled_during_cleanup:
+            raise asyncio.CancelledError

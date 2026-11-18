@@ -152,3 +152,37 @@ def test_expiry_blocks_new_turn_before_the_next_controller_poll(host):
     with pytest.raises(Hold):
         ctl.begin_turn(alice.client_id, alice.token, ctl._active, "after-client-expiry")
     assert stopped == [] and ctl._active is not None
+
+
+def test_terminal_end_before_begin_is_owned_idempotent_and_survives_until_expiry(host):
+    ctl, alice, bob, operator, now, stopped = host
+    submit(ctl, alice, interactive=True)
+    tick(ctl, operator)
+    grant = ctl._active
+    with pytest.raises(Hold):
+        ctl.end_turn(bob.client_id, bob.token, grant, "late")
+    ctl.end_turn(alice.client_id, alice.token, grant, "late")
+    ctl.end_turn(alice.client_id, alice.token, grant, "late")
+    with pytest.raises(Hold):
+        ctl.begin_turn(alice.client_id, alice.token, grant, "late")
+    assert ctl.status(alice.client_id, alice.token)["in_flight_turns"] == 0
+    now[0] = 106
+    assert tick(ctl, operator)["state"] == "IDLE" and stopped == ["job"]
+    with pytest.raises(Hold):
+        ctl.begin_turn(alice.client_id, alice.token, grant, "late")
+
+
+def test_failed_terminal_audit_never_claims_a_settled_live_turn(host):
+    ctl, alice, _bob, operator, _now, stopped = host
+    submit(ctl, alice, interactive=True)
+    tick(ctl, operator)
+    grant = ctl._active
+    ctl.begin_turn(alice.client_id, alice.token, grant, "running")
+    audit = ctl._audit_sink
+    ctl._audit_sink = lambda event: (_ for _ in ()).throw(OSError("fixture audit failure"))
+    with pytest.raises(Hold):
+        ctl.end_turn(alice.client_id, alice.token, grant, "running")
+    assert ctl._turns == {"running"} and "running" not in ctl._ended_turns and stopped == []
+    ctl._audit_sink = audit
+    ctl.end_turn(alice.client_id, alice.token, grant, "running")
+    assert "running" in ctl._ended_turns and ctl._turns == set()

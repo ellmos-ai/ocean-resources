@@ -215,16 +215,26 @@ class HostController(ClientLeaseLifecycle):
 
     def end_turn(self, client_id, token, grant: Grant, turn_id: str):
         client = self._authenticate(client_id, token)
+        identity(turn_id)
         with self._mutex:
-            self._owned(client, grant)
+            request = self._owned(client, grant)
             if turn_id in self._ended_turns:
                 return
-            if turn_id not in self._turns:
-                raise Hold("unknown interactive turn")
+            was_running = turn_id in self._turns
+            if (not request.interactive or not was_running
+                    and len(self._ended_turns) + len(self._turns) >= 4096):
+                raise Hold("invalid terminal interactive turn or full history")
             now = self._now()
-            self._turns.remove(turn_id)
+            # Cancellation can overtake a request whose client thread is still
+            # running. A confirmed terminal end must fence that late begin,
+            # even when its turn has not arrived yet. This tombstone belongs to
+            # this exact active grant; a new authority never adopts its journal.
+            self._audit("turn-ended", client_id=client_id, grant=asdict(grant),
+                        turn_id=turn_id, had_started=was_running)
+            self._turns.discard(turn_id)
             self._ended_turns.add(turn_id)
-            self._activity = now
+            if was_running:
+                self._activity = now
 
     def override(self, client_id, token, command: OverrideCommand):
         client = self._authenticate(client_id, token)

@@ -228,6 +228,18 @@ until explicit reconciliation. Up to 10,000 request records and 1,024 renewal
 IDs per request are retained; bounds require deliberate idle archival/restart,
 not unsafe identity reuse.
 
+Turn closure is terminal for the exact grant/authority and turn ID, including an
+end that arrives before its matching begin. A successful end is fsynced in the
+controller audit before the terminal tombstone is visible; late begin/replay is
+rejected. Model-client cancellation retains and joins the already running begin
+HTTP task, then settles the same turn ID with a bounded idempotent retry. A lost
+end response may also be settled by observing that the same owned request has
+already reached a native terminal state. Transport failure is never a substitute
+for native release evidence. A failed terminal audit keeps the old live turn
+and allocation held. Writer restart cannot adopt an old grant or resurrect a
+terminal turn. Repeated caller cancellation cannot abandon the retained cleanup
+task; cancellation is propagated after settlement or an explicit transport HOLD.
+
 BACH keeps a resident model grant across successive channels using its shared
 configured client. Foreground requests use P1, background requests P4; the
 existing inference gate still handles their actual per-turn fairness. The client

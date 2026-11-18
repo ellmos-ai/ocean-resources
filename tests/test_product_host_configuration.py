@@ -5,12 +5,14 @@ import json
 import platform
 import time
 from dataclasses import asdict
-from threading import Thread
+from threading import Event, Thread
 
 import pytest
 
-from ocean_resources import CapacityReadback, Hold
+from ocean_resources import CapacityReadback, Grant, Hold, SlotRequest
 from ocean_resources.configuration import ConfiguredHost, private_bytes, read_client
+from ocean_resources.contracts import RequestLease
+from ocean_resources.controller import FocusPolicy
 from ocean_resources.model_client import model_turn
 from ocean_resources.model_executor import ModelSpec
 from ocean_resources.profiles import native_architecture
@@ -126,3 +128,110 @@ def test_client_configuration_is_bound_to_host_writer_session(configured):
     client, _ = read_client(root / "old.json")
     with pytest.raises(Hold):
         client.status()
+
+
+@pytest.mark.parametrize(("lost_first_end", "repeat_cancel"), [(False, False), (True, False), (False, True)])
+def test_cancelled_begin_thread_is_joined_and_settled_over_http(configured, lost_first_end, repeat_cancel):
+    host, root, _port, _cp = configured
+    host.controller.policy = FocusPolicy(idle_seconds=30)
+    client, _models = read_client(root / "bach.json")
+    entered, release, finished = Event(), Event(), Event()
+    ending, release_end = Event(), Event()
+    calls = []
+    class DelayedBegin:
+        def __getattr__(self, name):
+            return getattr(client, name)
+        def begin_turn(self, grant, turn_id):
+            entered.set()
+            assert release.wait(5), "fixture begin barrier was not released"
+            try:
+                client.begin_turn(grant, turn_id)
+                calls.append("begin-applied")
+            finally:
+                finished.set()
+        def end_turn(self, grant, turn_id):
+            calls.append("end-attempt")
+            ending.set()
+            if repeat_cancel:
+                assert release_end.wait(5), "fixture terminal barrier was not released"
+            if lost_first_end and calls.count("end-attempt") == 1:
+                raise Hold("fixture request lost before delivery")
+            return client.end_turn(grant, turn_id)
+    async def operation():
+        async with model_turn(DelayedBegin(), "model", "chat", "foreground", ttl_seconds=30):
+            pytest.fail("cancelled model call entered inference")
+    async def scenario():
+        task = asyncio.create_task(operation())
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(.05)
+        try:
+            assert not task.done(), "cancellation discarded the still-running begin thread"
+        finally:
+            release.set()
+        if repeat_cancel:
+            assert await asyncio.to_thread(ending.wait, 5)
+            task.cancel()
+            await asyncio.sleep(.05)
+            try:
+                assert not task.done(), "repeated cancellation abandoned terminal cleanup"
+            finally:
+                release_end.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set()
+        assert (await asyncio.to_thread(client.status))["in_flight_turns"] == 0
+        state = await asyncio.to_thread(client.status)
+        request = await asyncio.to_thread(client.request_status, state["torch"]["request_id"])
+        await asyncio.to_thread(client.cancel, RequestLease(**request["lease"]))
+        for _ in range(100):
+            if (await asyncio.to_thread(client.status))["torch"] is None:
+                break
+            await asyncio.sleep(.02)
+        assert (await asyncio.to_thread(client.status))["torch"] is None
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        release_end.set()
+
+
+def test_http_terminal_end_fences_later_begin_without_a_phantom_turn(configured):
+    host, root, _port, _cp = configured
+    host.controller.policy = FocusPolicy(idle_seconds=30)
+    client, _models = read_client(root / "bach.json")
+    lease = client.submit_leased(SlotRequest("reordered", "model", "chat", client.host_id,
+                                            "reordered", interactive=True), 30)
+    deadline = time.monotonic() + 5
+    while True:
+        observation = client.request_status(lease.request_id)
+        if observation["state"] == "RUNNING":
+            break
+        assert time.monotonic() < deadline
+        time.sleep(.02)
+    grant = Grant(**observation["grant"])
+    release = Event()
+    outcome = []
+    def late():
+        assert release.wait(5)
+        try:
+            client.begin_turn(grant, "late-turn")
+            outcome.append("started")
+        except Hold:
+            outcome.append("terminally-held")
+    thread = Thread(target=late)
+    thread.start()
+    try:
+        client.end_turn(grant, "late-turn")
+        audit = [json.loads(line) for line in host.controller._audit_sink.path.read_text().splitlines()]
+        terminal = [row for row in audit if row["event"] == "turn-ended"]
+        assert terminal[-1]["turn_id"] == "late-turn" and terminal[-1]["had_started"] is False
+    finally:
+        release.set()
+        thread.join(5)
+    assert outcome == ["terminally-held"] and client.status()["in_flight_turns"] == 0
+    client.cancel(lease)
+    deadline = time.monotonic() + 5
+    while client.status()["torch"] is not None:
+        assert time.monotonic() < deadline
+        time.sleep(.02)
