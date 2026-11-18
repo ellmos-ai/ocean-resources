@@ -17,7 +17,7 @@ class ClientLeaseLifecycle:
             raise Hold("client lease lifetime must be finite and between 1 and 3600 seconds")
         return ttl
 
-    def submit_leased(self, client_id, token, request, ttl_seconds):
+    def submit_leased(self, client_id, token, request, ttl_seconds, *, _model_load=False):
         client = self._authenticate(client_id, token)
         ttl = self._lease_ttl(ttl_seconds)
         if not isinstance(request, SlotRequest):
@@ -27,7 +27,7 @@ class ClientLeaseLifecycle:
             old = self._leases.get(request.request_id)
             if old is not None:
                 if (self._owners.get(request.request_id) != client_id or old["request"] != request
-                        or old["initial_ttl"] != ttl or old["terminal"]
+                        or old["initial_ttl"] != ttl or old["model_load"] != _model_load or old["terminal"]
                         or now >= old["receipt"].expires_at):
                     raise Hold("expired, foreign or conflicting leased request")
                 return old["receipt"]
@@ -38,7 +38,7 @@ class ClientLeaseLifecycle:
             self._submit(client, request)
             self._leases[request.request_id] = {
                 "request": request, "initial_ttl": ttl, "receipt": receipt,
-                "terminal": None, "renewals": {},
+                "terminal": None, "renewals": {}, "model_load": _model_load,
             }
             return receipt
 
@@ -67,6 +67,8 @@ class ClientLeaseLifecycle:
             renewed = RequestLease(self._authority_id, receipt.request_id,
                                    receipt.generation + 1, self._now() + ttl)
             self._audit("client-lease-renewed", client_id=client_id, lease=asdict(renewed))
+            if entry["model_load"] and self._active is not None and self._active.request_id == receipt.request_id:
+                self.arbiter.bind_model_load_lease(self._active, renewed, client_id)
             entry["renewals"][renewal_id] = (receipt, ttl, renewed)
             entry["receipt"] = renewed
             return renewed
@@ -82,8 +84,12 @@ class ClientLeaseLifecycle:
                 raise Hold("request has no client lease")
             active = self._active if self._active and self._active.request_id == request_id else None
             state = ("RETURN_REQUESTED" if self._return else "RUNNING") if active else (entry["terminal"] or "QUEUED")
+            load = self.arbiter.load_state(active) if active else None
+            if load and load["phase"] in {"PREPARED", "MAY_LOAD", "RECOVERY_HOLD"}:
+                state = "RECOVERY_HOLD" if load["phase"] == "RECOVERY_HOLD" else "RETURN_REQUESTED" if self._return else "LOAD_PENDING"
             return {"schema": "ocean-client-request.v1", "state": state,
                     "lease": asdict(entry["receipt"]), "grant": asdict(active) if active else None,
+                    "model_load": load,
                     "expires_in_seconds": max(0, entry["receipt"].expires_at - self._now())}
 
     def _end_lease(self, request_id, reason):

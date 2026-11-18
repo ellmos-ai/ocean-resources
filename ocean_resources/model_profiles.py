@@ -9,14 +9,31 @@ def validate_model_profile(profile, evidence, *, host, system, architecture, now
               "model_digest", "model_spec", "peak_resident_bytes", "sample_count", "sample_interval_seconds",
               "started_at", "finished_at", "unload_ack_verified", "model_absence_verified",
               "server_version", "unmeasured_external_residency", "peak_cpu_units", "cpu_concurrency_units"}
+    version2 = evidence.get("schema") == "ocean-model-measurement.v2"
+    if version2:
+        fields |= {"peak_process_rss_bytes", "process_identity_verified", "measured_processes"}
     if set(evidence) != fields:
         raise ValueError("exact reviewed model measurement fields required")
     if (profile["schema"] != "ocean-reviewed-workload-profile.v1" or profile["kind"] != "model-api"
-            or evidence["schema"] != "ocean-model-measurement.v1"
-            or evidence["scope"] != "ollama-model-api" or evidence["method"] != "ollama-ps-and-native-cpu-v1"
+            or evidence["schema"] not in {"ocean-model-measurement.v1", "ocean-model-measurement.v2"}
+            or evidence["scope"] != "ollama-model-api" or evidence["method"] != (
+                "ollama-ps-native-rss-and-cpu-v2" if version2 else "ollama-ps-and-native-cpu-v1")
             or evidence["unload_ack_verified"] is not True or evidence["model_absence_verified"] is not True
             or evidence["unmeasured_external_residency"] is not False or evidence["server_version"] != "0.33.3"):
         raise ValueError("unsupported or incomplete model measurement scope")
+    if version2 and (not positive(evidence["peak_process_rss_bytes"])
+            or evidence["process_identity_verified"] is not True
+            or profile["ram_bytes"] < evidence["peak_process_rss_bytes"] + profile["ram_margin_bytes"]):
+        raise ValueError("v2 model profile lacks native process evidence and full peak margin")
+    if version2:
+        from .model_loading import ProcessIdentity
+        processes = evidence["measured_processes"]
+        if not isinstance(processes, list) or not 1 <= len(processes) <= 128:
+            raise ValueError("bounded native measurement process identities required")
+        identities = [ProcessIdentity(**p) for p in processes]
+        if (len({p.pid for p in identities}) != len(identities)
+                or len({p.boot_time for p in identities}) != 1):
+            raise ValueError("ambiguous measurement process scope")
     for key in ("profile_id", "socket_id", "host_id", "approved_by"):
         identity(profile[key])
     for key in ("workload_sha256", "evidence_sha256"):

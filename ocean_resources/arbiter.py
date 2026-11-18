@@ -15,11 +15,12 @@ from threading import RLock
 from copy import deepcopy
 from typing import Callable
 
+from .model_loading import ModelLoadLifecycle
 from .authority import HostWriterAuthority
 from .profiles import ReviewedProfileGate
 from .contracts import (
     CapacityReadback, Checkpoint, ExitReadback, Grant, Hold, Override,
-    ResourceSocket, SlotRequest, identity, instant, positive, sha256_hex,
+    RequestLease, ResourceSocket, SlotRequest, identity, instant, positive, sha256_hex,
 )
 
 
@@ -43,9 +44,10 @@ class _Active:
     return_requested: bool = False
     execution_evidence: dict | None = None
     checkpoint_evidence: dict | None = None
+    load_state: dict | None = None
 
 
-class HostLocalArbiter:
+class HostLocalArbiter(ModelLoadLifecycle):
     """One torch (socket + slot), with no implicit release on TTL or failure."""
     def __init__(
         self, authority: HostWriterAuthority, sockets: tuple[ResourceSocket, ...],
@@ -192,11 +194,13 @@ class HostLocalArbiter:
         return min(candidates, key=lambda r: (self._requests[r].priority, self._pending.index(r)))
 
     @serialized
-    def acquire(self) -> Grant:
+    def acquire(self, *, expected_request_id=None) -> Grant:
         self._require()
         if self._active is not None:
             raise Hold("existing torch has not been verifiably released")
         request = self._requests[self._select()]
+        if expected_request_id is not None and request.request_id != expected_request_id:
+            raise Hold("selected request changed before ordinary admission")
         socket = self._sockets[request.socket_id]
         self._admit_profile(socket)
         reading = self._measure()
@@ -204,7 +208,11 @@ class HostLocalArbiter:
             raise Hold("insufficient measured capacity after the system reserve")
         self._generation += 1
         grant = Grant(self._authority_id, self._generation, request.request_id, request.socket_id, request.slot_id)
-        self._active = _Active(grant, reading.sequence, self._now(), self._now() + self._ttl)
+        self._install_grant(grant, request, reading)
+        return grant
+
+    def _install_grant(self, grant, request, reading, *, load_state=None):
+        self._active = _Active(grant, reading.sequence, self._now(), self._now() + self._ttl, load_state=load_state)
         self.authority.record(asdict(self._active))
         self._pending.remove(request.request_id)
         self._chat_run = self._chat_run + 1 if request.interactive else 0
@@ -212,6 +220,60 @@ class HostLocalArbiter:
             self._override = None
         self._events.append({"event": "granted", "grant": asdict(grant)})
         return grant
+
+    @serialized
+    def acquire_model_load(self, request_id, spec, policy_sha256, observation):
+        return self._acquire_model_load(request_id, spec, policy_sha256, observation)
+
+    @serialized
+    def observe_model_capacity(self):
+        self._require()
+        callback = getattr(self._sensor, "model_load_readback", None)
+        if not callable(callback):
+            raise Hold("native model-load capacity sensor unavailable")
+        return callback()
+
+    @serialized
+    def begin_model_load(self, grant, spec, turn_id, observation):
+        return self._begin_model_load(grant, spec, turn_id, observation)
+
+    @serialized
+    def complete_model_load(self, grant, spec, turn_id, observation):
+        return self._complete_model_load(grant, spec, turn_id, observation)
+
+    @serialized
+    def abort_model_load(self, grant, turn_id):
+        active = self._current(grant)
+        state = active.load_state
+        if state is None or state["phase"] == "VERIFIED" or state["turn_id"] not in {None, turn_id}:
+            raise Hold("abort does not identify this staged load")
+        state.update(phase="ABORTED", turn_id=turn_id)
+        active.return_requested = True
+        self.authority.record(asdict(active))
+
+    @serialized
+    def hold_model_load(self, grant, reason):
+        return self._hold_model_load(grant, reason)
+
+    @serialized
+    def load_state(self, grant):
+        return self._load_state(grant)
+
+    @serialized
+    def bind_model_load_lease(self, grant, lease, client_id):
+        active = self._current(grant)
+        identity(client_id)
+        if (active.load_state is None or not isinstance(lease, RequestLease)
+                or lease.authority_id != grant.authority_id or lease.request_id != grant.request_id
+                or active.load_state.get("client_id", client_id) != client_id):
+            raise Hold("native model load lease binding changed")
+        old = active.load_state.get("client_lease")
+        if old is not None and (lease.generation < old["generation"]
+                or lease.generation == old["generation"] and asdict(lease) != old):
+            raise Hold("native model load lease generation regressed")
+        active.load_state.update(client_id=client_id, client_lease=asdict(lease))
+        self.authority.record(asdict(active))
+        return deepcopy(active.load_state)
 
     def _current(self, grant: Grant) -> _Active:
         self._require()
@@ -468,6 +530,8 @@ class HostLocalArbiter:
     def require_running(self, grant: Grant):
         active = self._current(grant)
         self._admit_profile(self._sockets[grant.socket_id])
+        if active.load_state and active.load_state["phase"] != "VERIFIED":
+            raise Hold("staged model load is not a running inference grant")
         if active.return_requested or self._now() > active.heartbeat_until:
             raise Hold("return requested or heartbeat expired")
 
@@ -479,11 +543,15 @@ class HostLocalArbiter:
         if active.return_requested or now > active.heartbeat_until:
             raise Hold("return requested or heartbeat expired; exit verification still required")
         active.heartbeat_until = now + self._ttl
+        if active.load_state is not None:
+            self.authority.record(asdict(active))
 
     @serialized
     def request_return(self, grant: Grant):
         active = self._current(grant)
         active.return_requested = True
+        if active.load_state is not None:
+            self.authority.record(asdict(active))
         self._events.append({"event": "return-requested", "grant": asdict(grant)})
 
     @serialized
@@ -495,6 +563,8 @@ class HostLocalArbiter:
         active = self._current(grant)
         if type(requeue) is not bool:
             raise Hold("requeue must be boolean")
+        if active.load_state and active.load_state["phase"] in {"MAY_LOAD", "RECOVERY_HOLD"}:
+            raise Hold("possible late model load requires explicit native reconciliation")
         if not isinstance(checkpoint, Checkpoint) or not checkpoint.valid_for(grant):
             raise Hold("checkpoint identity or integrity failed")
         now = self._now()
@@ -529,6 +599,7 @@ class HostLocalArbiter:
             "generation": self._generation,
             "torch": asdict(active.grant) if active else None,
             "execution_identity": active.execution_identity if active else None,
+            "load_state": deepcopy(active.load_state) if active else None,
             "return_requested": active.return_requested if active else False,
             "heartbeat_expired": self._now() > active.heartbeat_until if active else False,
             "chat_burst_count": self._chat_run,

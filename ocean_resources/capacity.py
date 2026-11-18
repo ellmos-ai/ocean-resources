@@ -210,9 +210,9 @@ class NativeCapacitySensor:
             except Exception as exc:
                 # No private paths, process command lines or backend exceptions.
                 errors.append(str(exc) if isinstance(exc, Hold) else "native-capacity-probe-failed")
-            return self._report(reading, errors, observed_idle)
+            return self._report(reading, errors, observed_idle, observations)
 
-    def _report(self, reading, errors, observed_idle):
+    def _report(self, reading, errors, observed_idle, observations=()):
         result = {
             "schema": "ocean-native-capacity.v1", "mode": "read-only-capacity-observation",
             "start_authorized": False, "reading": asdict(reading),
@@ -223,8 +223,23 @@ class NativeCapacitySensor:
                                "disk_bytes": self.policy.reserve_disk_bytes},
             "profile_admission": "separate-default-closed", "models_started": 0, "queue_writes": 0,
         }
+        if (len(observations) == 2 and all(o.platform == "Darwin" for o in observations)
+                and all(type(o.available_ram_bytes) is int for o in observations)
+                and all(o.pressure in {"normal", "elevated", "critical"} for o in observations)):
+            result["model_load_capacity"] = {
+                "physical_available_ram_bytes": min(o.available_ram_bytes for o in observations),
+                "reserve_ram_bytes": self.policy.reserve_ram_bytes,
+                "pressure_level": max({"normal": 1, "elevated": 2, "critical": 4}[o.pressure] for o in observations),
+            }
         self.last_observation = deepcopy(result)
         return result
+
+    def model_load_readback(self):
+        from .model_loading import ModelLoadCapacity
+        result = self.observe()
+        if "model_load_capacity" not in result:
+            raise Hold("native model load capacity is unavailable")
+        return ModelLoadCapacity(CapacityReadback(**result["reading"]), **result["model_load_capacity"])
 
     def __call__(self) -> CapacityReadback:
         return CapacityReadback(**self.observe()["reading"])
