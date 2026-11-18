@@ -38,19 +38,22 @@ class ModelSpec:
 
 class ModelAPIExecutor:
     """Owns only the exact configured model grant; host port owns native locking."""
-    def __init__(self, arbiter, spec: ModelSpec, port, state_directory: Path):
+    def __init__(self, arbiter, spec: ModelSpec, port, state_directory: Path, *, load_policy_sha256=None):
         directory = Path(state_directory)
         if (not isinstance(spec, ModelSpec) or not directory.is_absolute() or not directory.is_dir()
                 or directory.resolve() != directory or any(p.lower().startswith("onedrive") for p in directory.parts)):
             raise ValueError("explicit model spec and unlinked local state directory required")
         self.arbiter, self.spec, self.port, self.directory = arbiter, spec, port, directory
+        if load_policy_sha256 is not None:
+            sha256_hex(load_policy_sha256)
+        self.load_policy_sha256 = load_policy_sha256
         self._pid = os.getpid()
         self._execution = None
         self._absence_verified = False
 
     def adapter(self):
         return ComputeExecutorAdapter(self.start, self.checkpoint, self.stop, self.readback,
-                                      self.spec.fingerprint(), "model-api")
+                                      self.spec.fingerprint(), "model-api", self if self.load_policy_sha256 else None)
 
     def _owned(self, grant, execution_id, *, phase=None):
         if self._pid != os.getpid() or self._execution != (grant, execution_id):
@@ -71,6 +74,59 @@ class ModelAPIExecutor:
                                            self.spec.model, self.spec.digest, "admitted")
         # The normal host inference path performs and supervises any cold load.
         return True
+
+    def _observe_load(self, *, loaded, expected_process=None, accept=None):
+        if self.load_policy_sha256 is None:
+            raise Hold("model cold loading is not configured")
+        try:
+            return self.port.load_observation(self.spec, self.load_policy_sha256,
+                loaded=loaded, expected_process=expected_process,
+                capacity_reader=self.arbiter.observe_model_capacity, accept=accept)
+        except Hold:
+            raise
+        except Exception as exc:
+            raise Hold("native model load observation is unavailable") from exc
+
+    def prepare_load(self):
+        if getattr(self.port, "supports_load_pending", False) is not True:
+            raise Hold("native model residency accounting contract is unavailable; no load may start")
+        return self.spec, self.load_policy_sha256, self._observe_load(loaded=False)
+
+    def begin_load(self, grant, execution_id, turn_id):
+        self._owned(grant, execution_id)
+        state = self.arbiter.load_state(grant)
+        if state["phase"] == "MAY_LOAD" and state["turn_id"] == turn_id:
+            return state  # Never require absence again after an acknowledged intent.
+        observation = self._observe_load(loaded=False)
+        return self.arbiter.begin_model_load(grant, self.spec, turn_id, observation)
+
+    def complete_load(self, grant, execution_id, turn_id):
+        self._owned(grant, execution_id)
+        state = self.arbiter.load_state(grant)
+        committed = False
+        def accept(observation):
+            nonlocal committed
+            if committed:
+                raise Hold("native load proof cannot be committed twice")
+            self.arbiter.complete_model_load(grant, self.spec, turn_id, observation)
+            committed = True
+        self._observe_load(loaded=True, expected_process=state["baseline"]["process"], accept=accept)
+        if not committed:
+            raise Hold("native inference owner did not commit the model proof")
+
+    def abort_load(self, grant, execution_id, turn_id):
+        self._owned(grant, execution_id)
+        state = self.arbiter.load_state(grant)
+        if state["phase"] == "PREPARED":
+            observation = self._observe_load(loaded=False, expected_process=state["baseline"]["process"])
+            if observation.resident_bytes != 0:
+                raise Hold("unexpected residency before possible load")
+        else:
+            # Strict host gate + exact process + terminal ACK/absence, never the
+            # legacy warmup helper. An unknown dispatch keeps this call held.
+            self.port.abort_load(self.spec, state["baseline"]["process"],
+                                 lambda: self._owned(grant, execution_id))
+        self.arbiter.abort_model_load(grant, turn_id)
 
     def checkpoint(self, grant, execution_id):
         self._owned(grant, execution_id)
@@ -104,7 +160,11 @@ class ModelAPIExecutor:
         path = self.directory / (execution_id + ".checkpoint.json")
         if path.is_symlink() or json.loads(path.read_bytes()) != asdict(checkpoint):
             raise Hold("durable model checkpoint differs")
-        self.port.unload(self.spec, lambda: self._owned(grant, execution_id, phase="checkpointed"))
+        state = self.arbiter.load_state(grant)
+        if state is not None and state["phase"] == "PREPARED":
+            self.abort_load(grant, execution_id, "cancelled-before-begin")
+        else:
+            self.port.unload(self.spec, lambda: self._owned(grant, execution_id, phase="checkpointed"))
 
     def readback(self, grant, execution_id):
         self._owned(grant, execution_id)

@@ -37,9 +37,12 @@ class ControllerClient:
     allow_interactive: bool = False
     priority_floor: int = 1
     require_leases: bool = False
+    allow_model_load: bool = False
 
     def __post_init__(self):
         identity(self.client_id)
+        if type(self.allow_model_load) is not bool or self.allow_model_load and not self.require_leases:
+            raise ValueError("model loading requires an explicit leased client capability")
         if not isinstance(self.sockets, frozenset) or not self.sockets:
             raise ValueError("explicit immutable client socket scope required")
         for name in self.sockets:
@@ -193,6 +196,105 @@ class HostController(ClientLeaseLifecycle):
             self._owners[request.request_id] = client.client_id
             return result
 
+    def submit_model_load(self, client_id, token, request, ttl_seconds):
+        client = self._authenticate(client_id, token)
+        adapter = self.facade.adapters.get(request.socket_id) if isinstance(request, SlotRequest) else None
+        if (not client.allow_model_load or not client.require_leases or not request.interactive
+                or adapter is None or adapter.execution_kind != "model-api" or adapter.model_loader is None):
+            raise Hold("client or socket is not authorized for staged model loading")
+        with self._mutex:
+            if any(key != request.request_id and entry["model_load"] and not entry["terminal"]
+                   and entry["request"].socket_id == request.socket_id for key, entry in self._leases.items()):
+                raise Hold("another live model load request already owns or awaits this socket")
+            return self.submit_leased(client_id, token, request, ttl_seconds, _model_load=True)
+
+    def _owned_model_load(self, client, grant):
+        self._owned(client, grant)
+        entry = self._leases.get(grant.request_id)
+        if (entry is None or not entry["model_load"] or not client.allow_model_load
+                or self._owners.get(grant.request_id) != client.client_id):
+            raise Hold("client does not own this explicit model load request")
+        return entry
+
+    def begin_model_load(self, client_id, token, grant, turn_id):
+        client = self._authenticate(client_id, token)
+        identity(turn_id)
+        if not self._transition_lock.acquire(blocking=False):
+            raise Hold("controller handoff is in progress")
+        try:
+            with self._mutex:
+                entry = self._owned_model_load(client, grant)
+                if (entry["terminal"] or self._now() >= entry["receipt"].expires_at
+                        or self._return or self._audit_fault or turn_id in self._ended_turns
+                        or self._turns and turn_id not in self._turns):
+                    raise Hold("model load permission is unavailable or terminal")
+                self._turns.add(turn_id)
+            loader, execution_id = self.facade.model_loader(grant)
+            try:
+                permit = loader.begin_load(grant, execution_id, turn_id)
+            except Exception:
+                with self._mutex:
+                    # No ACK/POST privilege exists for a durably PREPARED attempt.
+                    # A failed read-only probe must not orphan an in-flight turn.
+                    current = self.arbiter.load_state(grant)
+                    if current and current["phase"] == "PREPARED":
+                        self._turns.discard(turn_id)
+                raise
+            with self._mutex:
+                # A concurrent lease cancellation cannot revive the authorization.
+                if entry["terminal"] or self._now() >= entry["receipt"].expires_at or self._return:
+                    self.arbiter.hold_model_load(grant, "client-lease-ended-before-load-ack")
+                    raise Hold("model load lease ended before acknowledgement")
+                self._activity = self._now()
+                return {**permit, "grant": asdict(grant)}
+        finally:
+            self._transition_lock.release()
+
+    def complete_model_load(self, client_id, token, grant, turn_id, successful):
+        client = self._authenticate(client_id, token)
+        identity(turn_id)
+        if type(successful) is not bool:
+            raise Hold("explicit model completion intent required")
+        if not self._transition_lock.acquire(blocking=False):
+            raise Hold("controller handoff is in progress")
+        try:
+            with self._mutex:
+                entry = self._owned_model_load(client, grant)
+                state = self.arbiter.load_state(grant)
+                if turn_id in self._ended_turns:
+                    if (state["turn_id"] == turn_id and
+                            state["phase"] == ("VERIFIED" if successful else "ABORTED")):
+                        return self.request_status(client_id, token, grant.request_id)
+                    raise Hold("terminal model load completion conflicts")
+                if state["turn_id"] not in {None, turn_id}:
+                    raise Hold("another load attempt owns the grant")
+                self._audit("model-load-completion-requested", grant=asdict(grant),
+                            turn_id=turn_id, successful=successful)
+                if successful and (entry["terminal"] or self._now() >= entry["receipt"].expires_at or self._return):
+                    self.arbiter.hold_model_load(grant, "client-lease-ended-before-load-proof")
+                    raise Hold("client load lease expired")
+            loader, execution_id = self.facade.model_loader(grant)
+            try:
+                if successful:
+                    loader.complete_load(grant, execution_id, turn_id)
+                else:
+                    loader.abort_load(grant, execution_id, turn_id)
+                with self._mutex:
+                    if successful and (entry["terminal"] or self._now() >= entry["receipt"].expires_at or self._return):
+                        self.arbiter.hold_model_load(grant, "client-lease-ended-during-load-proof")
+                        raise Hold("client load lease ended during native proof")
+                    self._turns.discard(turn_id)
+                    self._ended_turns.add(turn_id)
+                    self._activity = self._now()
+                    if not successful:
+                        self._return = ("model-load-aborted", False)
+                    return self.request_status(client_id, token, grant.request_id)
+            except Exception as exc:
+                self.arbiter.hold_model_load(grant, "native-model-load-completion-unproved")
+                raise Hold("model load requires independent native reconciliation") from exc
+        finally:
+            self._transition_lock.release()
+
     def begin_turn(self, client_id, token, grant: Grant, turn_id: str):
         client = self._authenticate(client_id, token)
         identity(turn_id)
@@ -269,11 +371,16 @@ class HostController(ClientLeaseLifecycle):
         if not self._transition and state["torch"] != (asdict(self._active) if self._active else None):
             # Never adopt a reservation, including one retained by a failed start.
             error = "unowned or failed-start torch; original execution reconciliation required"
+        load = state.get("load_state")
+        pending = load and load["phase"] in {"PREPARED", "MAY_LOAD"}
+        recovery = load and load["phase"] == "RECOVERY_HOLD"
         return {"schema": "ocean-host-controller.v1", "host_id": state["host_id"],
-                "authority_id": self._authority_id, "state": "HOLD" if error else (
+                "authority_id": self._authority_id, "state": "RECOVERY_HOLD" if recovery else "HOLD" if error else (
+                    "LOAD_PENDING" if pending else
                     "TRANSITION" if self._transition else "RETURN_REQUESTED" if self._return else (
                         "RUNNING" if self._active else "IDLE")),
                 "error": error, "torch": state["torch"], "waiting": state["waiting"],
+                "model_load": deepcopy(load),
                 "override": state["override"], "in_flight_turns": len(self._turns),
                 "return": self._return, "transition": deepcopy(self._transition),
                 "policy": asdict(self.policy), "protected_until": self._protected_until,
@@ -310,6 +417,16 @@ class HostController(ClientLeaseLifecycle):
                     self._pending_audit = None
                     self._error = None
                 if self._active is not None:
+                    load = state.get("load_state")
+                    if load and load["phase"] in {"PREPARED", "MAY_LOAD", "RECOVERY_HOLD"} and not (
+                            load["phase"] == "PREPARED" and self._return):
+                        if (load["phase"] == "RECOVERY_HOLD" or self._return or state["return_requested"]
+                                or state["heartbeat_expired"] or now >= load["deadline"]):
+                            self.arbiter.hold_model_load(self._active, "load-liveness-ended-or-recovery-required")
+                            return self._snapshot()
+                        self.arbiter.heartbeat(self._active)
+                        self._error = None
+                        return self._snapshot()
                     request = self.arbiter.request_for(self._active)
                     waiting = bool(state["waiting"])
                     candidate = self.arbiter.next_request() if waiting else None
@@ -362,7 +479,9 @@ class HostController(ClientLeaseLifecycle):
                 burst_limit = state["policy"]["max_chat_burst"]
                 self._audit("start-requested", candidate_request=self.arbiter.next_request().request_id)
                 self._transition = {"action": "start", "token": secrets.token_hex(16)}
-            started = self.facade.start_next()
+                selected_id = self.arbiter.next_request().request_id
+                staged = self._leases.get(selected_id, {}).get("model_load", False)
+            started = self.facade.start_next(model_load_request_id=selected_id if staged else None)
             with self._mutex:
                 self._active = started
                 self._started = self._activity = self._now()

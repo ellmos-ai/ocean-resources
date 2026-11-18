@@ -131,10 +131,18 @@ class ConfiguredHost:
                 if socket_id in adapters:
                     raise Hold("duplicate executor socket")
                 if item["kind"] == "model-api":
-                    exact(item, ("socket_id", "kind", "model"))
+                    exact(item, {"socket_id", "kind", "model"} | ({"load_policy_sha256"} if "load_policy_sha256" in item else set()))
                     spec = ModelSpec(**item["model"])
-                    executor = ModelAPIExecutor(self.arbiter, spec, model_port_factory(), state)
-                    models.append({"socket_id": socket_id, **asdict(spec)})
+                    load_policy = item.get("load_policy_sha256")
+                    port = model_port_factory()
+                    if load_policy is not None and getattr(port, "supports_load_pending", False) is not True:
+                        raise Hold("native model residency accounting contract is unavailable; LOAD_PENDING is disabled")
+                    executor = ModelAPIExecutor(self.arbiter, spec, port, state,
+                                                load_policy_sha256=load_policy)
+                    model = {"socket_id": socket_id, **asdict(spec)}
+                    if load_policy is not None:
+                        model["load_policy_sha256"] = load_policy
+                    models.append(model)
                 elif item["kind"] == "cpu-owned-process":
                     exact(item, ("socket_id", "kind", "command", "checkpoint_validator"))
                     command = dict(item["command"])
@@ -155,11 +163,13 @@ class ConfiguredHost:
                 raise Hold("every configured socket needs exactly one native executor")
             clients = []
             for item in config["clients"]:
-                exact(item, ("client_id", "sockets", "token_file", "operator", "allow_interactive",
-                             "priority_floor", "require_leases", "endpoint_file"))
+                exact(item, {"client_id", "sockets", "token_file", "operator", "allow_interactive",
+                             "priority_floor", "require_leases", "endpoint_file"} |
+                      ({"allow_model_load"} if "allow_model_load" in item else set()))
                 if item["require_leases"] is not True:
                     raise Hold("product clients require bounded request leases")
                 fields = {k: item[k] for k in ("client_id", "operator", "allow_interactive", "priority_floor", "require_leases")}
+                fields["allow_model_load"] = item.get("allow_model_load", False)
                 clients.append(ControllerClient(**fields, sockets=frozenset(item["sockets"]),
                     token=private_bytes(item["token_file"], 256).decode("ascii").strip()))
             operators = [c for c in clients if c.operator]
@@ -171,7 +181,8 @@ class ConfiguredHost:
                 _publish_private(item["endpoint_file"], {"schema": "ocean-host-client-config.v1",
                     "port": self.service.port, "host_id": config["host_id"], "authority_id": self.writer.authority_id,
                     "client_id": client.client_id, "token_file": item["token_file"],
-                    "models": [m for m in models if m["socket_id"] in client.sockets]})
+                    "models": [{k: v for k, v in m.items() if client.allow_model_load or k != "load_policy_sha256"}
+                               for m in models if m["socket_id"] in client.sockets]})
         except BaseException:
             if self.service is not None:
                 self.service.close()

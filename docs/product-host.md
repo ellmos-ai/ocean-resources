@@ -276,3 +276,13 @@ target absent, then the arbiter separately checks current host capacity. A
 timeout, malformed response, wrong digest, unresolved previous intent or active
 native turn retains HOLD. An ambiguous POST is not automatically repeated.
 The independent pressure watchdog keeps its own pressure policy unchanged.
+
+## Optional staged model-load protocol
+
+The model-only `LOAD_PENDING` extension and its additional v2 proof, lease,
+intent and cancellation contracts are described in
+[model-load-pending.md](model-load-pending.md). It preserves the complete reviewed
+peak allocation. The current BACH Ollama 0.33.3 port cannot yet prove the required
+physical-memory attribution and rejects activation of this extension. Do not
+replace a working unconfigured BACH cold-start path with an unusable host profile
+or run a separate CPU authority beside that unbrokered model.

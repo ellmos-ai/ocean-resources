@@ -61,7 +61,7 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
         if isinstance(active, dict) and active.get("socket_id") == socket_id:
             try:
                 own = await asyncio.to_thread(client.request_status, active["request_id"])
-                if own["state"] == "RUNNING":
+                if own["state"] in {"RUNNING", "LOAD_PENDING"}:
                     lease = RequestLease(**own["lease"])
             except Hold:
                 pass  # A different configured client owns this reservation.
@@ -81,7 +81,7 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
             if observation["state"] == "RUNNING":
                 grant = Grant(**observation["grant"])
                 break
-            if observation["state"] != "QUEUED" or time.monotonic() >= deadline:
+            if observation["state"] not in {"QUEUED", "LOAD_PENDING"} or time.monotonic() >= deadline:
                 raise Hold("model resource request is unavailable or its wait deadline expired")
             await asyncio.sleep(.1)
 
