@@ -7,6 +7,37 @@ from dataclasses import asdict
 
 from .contracts import Grant, Hold, RequestLease, SlotRequest
 
+_REQUEST_CANCEL_SECONDS = 30
+
+
+async def _cancel_submitted_request(client, request_id):
+    """Reconcile only this submitted identity; an ACK requests native return."""
+    deadline = time.monotonic() + _REQUEST_CANCEL_SECONDS
+    while True:
+        try:
+            current = await asyncio.to_thread(client.request_status, request_id)
+            receipt = RequestLease(**current["lease"])
+            if receipt.authority_id != client.authority_id or receipt.request_id != request_id:
+                raise Hold("unrelated request cancellation observation")
+            if current["grant"] is None and current["state"] in {"FINISHED", "CANCELLED", "EXPIRED"}:
+                return
+            # A native handoff or concurrent owner renewal can reject this CAS.
+            # Every retry must obtain the current lease from the same authority.
+            result = await asyncio.to_thread(client.cancel, receipt)
+            if RequestLease(**result["lease"]) != receipt:
+                raise Hold("unrelated request cancellation acknowledgement")
+            if result["grant"] is None and result["state"] in {"FINISHED", "CANCELLED", "EXPIRED"}:
+                return
+            if result["state"] == "RETURN_REQUESTED" and result["grant"] is not None:
+                grant = Grant(**result["grant"])
+                if grant.authority_id == receipt.authority_id and grant.request_id == request_id:
+                    return  # Cancellation accepted; native release is still pending.
+            raise Hold("request cancellation acknowledgement is unresolved")
+        except (Hold, KeyError, TypeError, ValueError) as exc:
+            if time.monotonic() >= deadline:
+                raise Hold("model resource request cancellation remains unconfirmed") from exc
+            await asyncio.sleep(.1)
+
 
 @asynccontextmanager
 async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, ttl_seconds=1800,
@@ -14,7 +45,7 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
     if priority not in {"foreground", "background"} or not 1 <= wait_seconds <= 3600:
         raise ValueError("explicit bounded model turn policy required")
     lease = grant = None
-    submitted = False
+    submit_call = request_id = None
     turn_attempted = turn_started = False
     begin_call = None
     turn_id = uuid.uuid4().hex
@@ -38,8 +69,10 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
             request_id = "model-" + uuid.uuid4().hex
             request = SlotRequest(request_id, socket_id, slot_id, client.host_id, request_id,
                                   priority=1 if priority == "foreground" else 4, interactive=True)
-            lease = await asyncio.to_thread(client.submit_leased, request, ttl_seconds)
-            submitted = True
+            # Retain the known immutable identity before the HTTP thread starts.
+            # Cancellation or a lost response must not orphan its queued request.
+            submit_call = asyncio.create_task(asyncio.to_thread(client.submit_leased, request, ttl_seconds))
+            lease = await asyncio.shield(submit_call)
         while True:
             if check_ready is not None:
                 check_ready()
@@ -84,7 +117,12 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
         yield {"grant": asdict(grant), "lease": asdict(lease), "renewal": renewal}
     finally:
         async def settle():
-            nonlocal turn_started
+            nonlocal lease, turn_started
+            if submit_call is not None:
+                try:
+                    lease = await asyncio.shield(submit_call)
+                except Hold:
+                    pass  # A lost response is reconciled by the exact request ID.
             if renewal is not None:
                 renewal.cancel()
                 try:
@@ -114,9 +152,8 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
                                 pass
                             if attempt and turn_started:
                                 raise  # Explicit uncertainty; never claim RAM was freed.
-            elif lease is not None and submitted:
-                current = await asyncio.to_thread(client.request_status, lease.request_id)
-                await asyncio.shield(asyncio.to_thread(client.cancel, RequestLease(**current["lease"])))
+            elif submit_call is not None:
+                await _cancel_submitted_request(client, request_id)
 
         # Shield the entire finite transport cleanup, retaining it even across
         # repeated caller cancellations. The caller sees cancellation only after

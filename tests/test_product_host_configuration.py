@@ -235,3 +235,146 @@ def test_http_terminal_end_fences_later_begin_without_a_phantom_turn(configured)
     while client.status()["torch"] is not None:
         assert time.monotonic() < deadline
         time.sleep(.02)
+
+
+@pytest.mark.parametrize("fault", ["none", "submit-response", "cancel-response", "cancel-request",
+                                  "repeat-cancel", "lease-race", "transition"])
+def test_cancelled_submit_is_joined_and_cancelled_with_its_native_lease(configured, monkeypatch, fault):
+    host, root, port, _cp = configured
+    host.controller.policy = FocusPolicy(idle_seconds=30)
+    client, _models = read_client(root / "bach.json")
+    entered, release, submitted = Event(), Event(), Event()
+    cancelling, release_cancel, transition_held = Event(), Event(), Event()
+    starting, release_start = Event(), Event()
+    requests, receipts = [], []
+    if fault != "transition":
+        monkeypatch.setattr(host.service, "_start_poll", lambda: None)
+    else:
+        verify = port.verify_available
+        def gated_start(spec):
+            starting.set()
+            assert release_start.wait(5), "fixture model-start barrier was not released"
+            verify(spec)
+        monkeypatch.setattr(port, "verify_available", gated_start)
+    class DelayedSubmit:
+        def __getattr__(self, name):
+            return getattr(client, name)
+        def submit_leased(self, request, ttl_seconds):
+            requests.append(request)
+            entered.set()
+            assert release.wait(5), "fixture submit barrier was not released"
+            receipt = client.submit_leased(request, ttl_seconds)
+            submitted.set()
+            if fault == "transition":
+                assert starting.wait(5), "fixture native transition did not start"
+            if fault == "submit-response":
+                raise Hold("fixture submit response lost after native application")
+            return receipt
+        def cancel(self, receipt):
+            receipts.append(receipt)
+            cancelling.set()
+            if fault == "repeat-cancel":
+                assert release_cancel.wait(5), "fixture cancel barrier was not released"
+            if len(receipts) == 1:
+                if fault == "cancel-request":
+                    raise Hold("fixture cancel request lost before delivery")
+                if fault == "lease-race":
+                    client.renew(receipt, "concurrent-owner-renewal", 30)
+            try:
+                value = client.cancel(receipt)
+            except Hold:
+                transition_held.set()
+                raise
+            if fault == "cancel-response" and len(receipts) == 1:
+                raise Hold("fixture cancel response lost after native application")
+            return value
+    async def operation():
+        async with model_turn(DelayedSubmit(), "model", "chat", "foreground", ttl_seconds=30):
+            pytest.fail("cancelled submission entered inference")
+    async def scenario():
+        task = asyncio.create_task(operation())
+        assert await asyncio.to_thread(entered.wait, 5)
+        task.cancel()
+        await asyncio.sleep(.05)
+        try:
+            assert not task.done(), "cancellation abandoned its running submit thread"
+        finally:
+            release.set()
+        if fault == "repeat-cancel":
+            assert await asyncio.to_thread(cancelling.wait, 5)
+            task.cancel()
+            await asyncio.sleep(.05)
+            try:
+                assert not task.done(), "repeated cancellation abandoned request cleanup"
+            finally:
+                release_cancel.set()
+        if fault == "transition":
+            assert await asyncio.to_thread(transition_held.wait, 5)
+            assert not task.done(), "transient handoff HOLD abandoned request cleanup"
+            release_start.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert submitted.is_set() and len(requests) == 1 and receipts
+        request_id = requests[0].request_id
+        assert all(r.authority_id == client.authority_id and r.request_id == request_id for r in receipts)
+        if fault == "lease-race":
+            assert [r.generation for r in receipts] == [1, 2]
+        deadline = time.monotonic() + 5
+        while True:
+            current = await asyncio.to_thread(client.request_status, request_id)
+            if current["grant"] is None and current["state"] == "CANCELLED":
+                break
+            assert time.monotonic() < deadline
+            await asyncio.sleep(.02)
+        state = await asyncio.to_thread(client.status)
+        assert state["in_flight_turns"] == 0 and state["waiting"] == [] and state["torch"] is None
+        assert port.calls == (["unload"] if fault == "transition" else [])
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+        release_cancel.set()
+        release_start.set()
+
+
+@pytest.mark.parametrize("readback", ["confirmed", "unavailable", "foreign"])
+def test_lost_submit_response_is_reconciled_or_reports_bound_uncertainty(configured, monkeypatch, readback):
+    host, root, port, _cp = configured
+    client, _models = read_client(root / "bach.json")
+    monkeypatch.setattr(host.service, "_start_poll", lambda: None)
+    monkeypatch.setattr("ocean_resources.model_client._REQUEST_CANCEL_SECONDS", .02)
+    requests, cancellations = [], []
+    class LostResponse:
+        def __getattr__(self, name):
+            return getattr(client, name)
+        def submit_leased(self, request, ttl_seconds):
+            requests.append(request)
+            client.submit_leased(request, ttl_seconds)
+            raise Hold("fixture submit response lost")
+        def request_status(self, request_id):
+            assert request_id == requests[0].request_id
+            if readback == "unavailable":
+                raise Hold("fixture authority unreachable")
+            value = client.request_status(request_id)
+            if readback == "foreign":
+                value["lease"]["authority_id"] = "foreign-authority"
+            return value
+        def cancel(self, receipt):
+            cancellations.append(receipt)
+            return client.cancel(receipt)
+    async def operation():
+        async with model_turn(LostResponse(), "model", "chat", "foreground", ttl_seconds=30):
+            pytest.fail("uncertain submission entered inference")
+    reason = "fixture submit response lost" if readback == "confirmed" else "cancellation remains unconfirmed"
+    with pytest.raises(Hold, match=reason):
+        asyncio.run(operation())
+    assert len(requests) == 1 and port.calls == []
+    state = client.request_status(requests[0].request_id)
+    try:
+        assert state["grant"] is None
+        if readback == "confirmed":
+            assert state["state"] == "CANCELLED" and len(cancellations) == 1
+        else:
+            assert state["state"] == "QUEUED" and cancellations == []
+    finally:
+        client.cancel(RequestLease(**state["lease"]))

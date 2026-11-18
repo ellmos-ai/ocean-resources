@@ -240,6 +240,16 @@ and allocation held. Writer restart cannot adopt an old grant or resurrect a
 terminal turn. Repeated caller cancellation cannot abandon the retained cleanup
 task; cancellation is propagated after settlement or an explicit transport HOLD.
 
+The first leased submit follows the same retained-task contract. Its immutable
+request ID exists before the HTTP thread starts. A cancelled call or lost submit
+response is reconciled through that exact owned request and cancelled using its
+fresh native lease; concurrent renewal and native handoff HOLD trigger bounded
+retries. A cancelled waiting request cannot later start. An accepted cancellation
+of an already running grant requests its native return and does not assert that
+RAM has been released. The retry window is 30 seconds, retaining already running
+bounded HTTP calls. Unreachable or mismatched authority readback ends with an
+explicit unresolved HOLD, never fabricated cancellation or capacity evidence.
+
 BACH keeps a resident model grant across successive channels using its shared
 configured client. Foreground requests use P1, background requests P4; the
 existing inference gate still handles their actual per-turn fairness. The client
