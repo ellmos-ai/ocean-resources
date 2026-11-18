@@ -46,6 +46,25 @@ turn ID remain visible to authenticated native status/readback for diagnosis.
 A terminal attempt fences a delayed or duplicated begin. A completed proof can
 be acknowledged idempotently after a lost HTTP reply.
 
+The begin reply also carries a native writer-readback reference. A copied
+`MAY_LOAD` reply is not dispatch authority. Under its actual inference owner,
+BACH must re-read the original private writer inode and prove its exclusive
+native lock, live PID/creation/boot identity, current writer epoch, exact
+grant/request/turn/execution, current client lease, full profile and policy.
+Profile/evidence files are revalidated and the journal is read again after that
+potentially slow work. Torn, replaced, unlocked, stale or terminal records close
+the path. Client cancellation and pending host heartbeats are journaled before
+acknowledgement. A close/reopen in the same PID stamps a new writer epoch while
+preserving unresolved reservations; it cannot revive an old permit.
+The native reader currently supports POSIX inode/flock semantics; a Windows
+staged caller remains closed until an equivalent reviewed native reader exists.
+This does not change ordinary Windows compute grants.
+
+Controller selection pins the expected request in both ordinary and staged
+admission. A concurrent higher-priority arrival must be selected anew rather than
+silently entering the wrong protocol. Ordinary `end_turn` cannot terminalize a
+staged attempt; it must use the explicit native load completion operation.
+
 ## Original cold-start policy and the full peak
 
 The reviewed v1 policy remains: minimum available RAM 6 GiB, hard floor 2 GiB,
@@ -124,6 +143,12 @@ inference dispatch blocks entry; an uncertain unload retains its intent. A crash
 journal blocks a replacement writer. Do not clear files, lower the profile, treat
 a deadline as proof, or start a parallel CPU authority beside an unbrokered model
 as a recovery shortcut.
+
+The process and inference owner are rechecked after metadata and intent fsync,
+before the unload POST. Terminal `ABORTED` is committed by a required local
+callback while the same inference owner still protects the absence proof,
+including the already-absent case. Thus a delayed former dispatcher cannot enter
+between proof and terminalization and spend its stale permit after release.
 
 ## Acceptance still required for production
 

@@ -112,14 +112,16 @@ class BACHFacade:
             priority=priority, pointer=pointer,
         )
 
-    def start_next(self, *, model_load_request_id=None) -> Grant:
+    def start_next(self, *, model_load_request_id=None, expected_request_id=None) -> Grant:
         with self._mutex:
             if model_load_request_id is None:
-                grant = self.arbiter.acquire()
+                grant = self.arbiter.acquire(expected_request_id=expected_request_id)
             else:
                 selected = self.arbiter.next_request()
                 adapter = self.adapters.get(selected.socket_id)
-                if (selected.request_id != model_load_request_id or adapter is None
+                if (selected.request_id != model_load_request_id
+                        or expected_request_id is not None and selected.request_id != expected_request_id
+                        or adapter is None
                         or adapter.execution_kind != "model-api" or adapter.model_loader is None):
                     raise Hold("selected request has no native model-load adapter")
                 spec, policy, observation = adapter.model_loader.prepare_load()

@@ -20,7 +20,7 @@ from .authority import HostWriterAuthority
 from .profiles import ReviewedProfileGate
 from .contracts import (
     CapacityReadback, Checkpoint, ExitReadback, Grant, Hold, Override,
-    ResourceSocket, SlotRequest, identity, instant, positive, sha256_hex,
+    RequestLease, ResourceSocket, SlotRequest, identity, instant, positive, sha256_hex,
 )
 
 
@@ -194,11 +194,13 @@ class HostLocalArbiter(ModelLoadLifecycle):
         return min(candidates, key=lambda r: (self._requests[r].priority, self._pending.index(r)))
 
     @serialized
-    def acquire(self) -> Grant:
+    def acquire(self, *, expected_request_id=None) -> Grant:
         self._require()
         if self._active is not None:
             raise Hold("existing torch has not been verifiably released")
         request = self._requests[self._select()]
+        if expected_request_id is not None and request.request_id != expected_request_id:
+            raise Hold("selected request changed before ordinary admission")
         socket = self._sockets[request.socket_id]
         self._admit_profile(socket)
         reading = self._measure()
@@ -256,6 +258,22 @@ class HostLocalArbiter(ModelLoadLifecycle):
     @serialized
     def load_state(self, grant):
         return self._load_state(grant)
+
+    @serialized
+    def bind_model_load_lease(self, grant, lease, client_id):
+        active = self._current(grant)
+        identity(client_id)
+        if (active.load_state is None or not isinstance(lease, RequestLease)
+                or lease.authority_id != grant.authority_id or lease.request_id != grant.request_id
+                or active.load_state.get("client_id", client_id) != client_id):
+            raise Hold("native model load lease binding changed")
+        old = active.load_state.get("client_lease")
+        if old is not None and (lease.generation < old["generation"]
+                or lease.generation == old["generation"] and asdict(lease) != old):
+            raise Hold("native model load lease generation regressed")
+        active.load_state.update(client_id=client_id, client_lease=asdict(lease))
+        self.authority.record(asdict(active))
+        return deepcopy(active.load_state)
 
     def _current(self, grant: Grant) -> _Active:
         self._require()
@@ -525,11 +543,15 @@ class HostLocalArbiter(ModelLoadLifecycle):
         if active.return_requested or now > active.heartbeat_until:
             raise Hold("return requested or heartbeat expired; exit verification still required")
         active.heartbeat_until = now + self._ttl
+        if active.load_state is not None:
+            self.authority.record(asdict(active))
 
     @serialized
     def request_return(self, grant: Grant):
         active = self._current(grant)
         active.return_requested = True
+        if active.load_state is not None:
+            self.authority.record(asdict(active))
         self._events.append({"event": "return-requested", "grant": asdict(grant)})
 
     @serialized

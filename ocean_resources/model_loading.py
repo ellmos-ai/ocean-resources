@@ -158,6 +158,7 @@ class ModelLoadLifecycle:
         grant = Grant(self._authority_id, self._generation, request_id, request.socket_id, request.slot_id)
         state = {"schema": "ocean-model-load.v1", "phase": "PREPARED", "turn_id": None,
             "policy_sha256": policy_sha256, "profile_sha256": profile["profile_sha256"],
+            "profile_readback": profile["readback"], "socket": asdict(socket),
             "profile_ram_bytes": socket.ram_bytes, "profile_cpu_units": socket.cpu_units,
             "workload_sha256": spec.fingerprint(), "spec": asdict(spec),
             "prepared_at": self._now(), "deadline": self._now() + MAX_SECONDS,
@@ -184,7 +185,8 @@ class ModelLoadLifecycle:
         if asdict(observation.process) != state["baseline"]["process"]:
             raise Hold("model server process changed before load")
         previous = deepcopy(state)
-        state.update(phase="MAY_LOAD", turn_id=turn_id, baseline=asdict(observation))
+        state.update(phase="MAY_LOAD", turn_id=turn_id, baseline=asdict(observation),
+                     execution_id=active.execution_identity)
         active.metric_sequence = cap.reading.sequence
         try:
             self.authority.record(asdict(active))  # Durable before any client may POST.

@@ -192,7 +192,10 @@ class ReviewedProfileGate:
         if (profile["kind"] != "model-api" or evidence.get("schema") != "ocean-model-measurement.v2"
                 or evidence.get("process_identity_verified") is not True):
             raise Hold("LOAD_PENDING requires reviewed model API and native process peak evidence")
-        return {"profile": profile, "profile_sha256": source.profile_sha256}
+        return {"profile": profile, "profile_sha256": source.profile_sha256,
+                "readback": {"profile_path": str(source.profile_path),
+                             "evidence_path": str(source.evidence_path),
+                             "max_age_seconds": self._max_age}}
 
     def inspect(self) -> dict:
         """Read-only validation for configured pins; never acquires a grant."""

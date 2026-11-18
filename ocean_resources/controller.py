@@ -246,7 +246,9 @@ class HostController(ClientLeaseLifecycle):
                     self.arbiter.hold_model_load(grant, "client-lease-ended-before-load-ack")
                     raise Hold("model load lease ended before acknowledgement")
                 self._activity = self._now()
-                return {**permit, "grant": asdict(grant)}
+                permit = self.arbiter.bind_model_load_lease(grant, entry["receipt"], client_id)
+                return {**permit, "grant": asdict(grant),
+                        "writer_readback": self.arbiter.authority.model_dispatch_reference()}
         finally:
             self._transition_lock.release()
 
@@ -320,6 +322,9 @@ class HostController(ClientLeaseLifecycle):
         identity(turn_id)
         with self._mutex:
             request = self._owned(client, grant)
+            load = self.arbiter.load_state(grant)
+            if load and (load["phase"] != "VERIFIED" or turn_id == load["turn_id"]):
+                raise Hold("staged load requires its exact native completion protocol")
             if turn_id in self._ended_turns:
                 return
             was_running = turn_id in self._turns
@@ -481,7 +486,8 @@ class HostController(ClientLeaseLifecycle):
                 self._transition = {"action": "start", "token": secrets.token_hex(16)}
                 selected_id = self.arbiter.next_request().request_id
                 staged = self._leases.get(selected_id, {}).get("model_load", False)
-            started = self.facade.start_next(model_load_request_id=selected_id if staged else None)
+            started = self.facade.start_next(model_load_request_id=selected_id if staged else None,
+                                             expected_request_id=selected_id)
             with self._mutex:
                 self._active = started
                 self._started = self._activity = self._now()

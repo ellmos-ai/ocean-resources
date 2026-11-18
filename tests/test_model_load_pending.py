@@ -102,9 +102,11 @@ def pending_host(tmp_path):
                 raise Hold("fixture unknown unload")
             self.calls.append("guarded-unload")
             self.resident = 0
-        def abort_load(self, actual, expected, owned):
+        def abort_load(self, actual, expected, owned, *, accept=None):
             assert expected == asdict(self.identity)
             self.unload(actual, owned)
+            if accept is not None:
+                accept()
         def resident_bytes(self, actual):
             if self.unknown:
                 raise Hold("fixture unknown residency")

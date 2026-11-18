@@ -67,6 +67,8 @@ class ClientLeaseLifecycle:
             renewed = RequestLease(self._authority_id, receipt.request_id,
                                    receipt.generation + 1, self._now() + ttl)
             self._audit("client-lease-renewed", client_id=client_id, lease=asdict(renewed))
+            if entry["model_load"] and self._active is not None and self._active.request_id == receipt.request_id:
+                self.arbiter.bind_model_load_lease(self._active, renewed, client_id)
             entry["renewals"][renewal_id] = (receipt, ttl, renewed)
             entry["receipt"] = renewed
             return renewed

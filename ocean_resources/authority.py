@@ -71,7 +71,11 @@ class HostWriterAuthority:
         try:
             if created:
                 self.record(None)
-            self.unresolved()
+            previous = self.unresolved()
+            # Preserve unresolved work while publishing this new writer epoch.
+            # A live process can close/reopen the same inode: PID/ctime alone
+            # must never make an old MAY_LOAD journal look currently authorized.
+            self.record(previous)
         except Exception:
             self.__exit__()
             raise
@@ -96,7 +100,8 @@ class HostWriterAuthority:
 
     def record(self, unresolved: dict | None):
         self.require()
-        payload = json.dumps({"unresolved": unresolved}, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        payload = json.dumps({"authority_id": self.authority_id, "unresolved": unresolved},
+                             sort_keys=True, separators=(",", ":"), allow_nan=False)
         journal = json.dumps({
             "payload": payload,
             "sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
@@ -127,13 +132,26 @@ class HostWriterAuthority:
             if hashlib.sha256(payload.encode("utf-8")).hexdigest() != outer["sha256"]:
                 raise ValueError("journal hash")
             result = json.loads(payload)
-            if not isinstance(result, dict) or set(result) != {"unresolved"} or (
+            if (not isinstance(result, dict) or set(result) not in (
+                    {"unresolved"}, {"unresolved", "authority_id"}) or (
                 result["unresolved"] is not None and not isinstance(result["unresolved"], dict)
-            ):
+            )):
                 raise ValueError("journal schema")
+            if "authority_id" in result:
+                identity(result["authority_id"])
             return result["unresolved"]
         except (ValueError, KeyError, TypeError, UnicodeError) as exc:
             raise Hold("writer journal is invalid; independent recovery required") from exc
+
+    def model_dispatch_reference(self):
+        """Readback reference for this held writer, never a replacement authority."""
+        self.require()
+        from .model_dispatch import native_writer_identity
+        opened = os.fstat(self._stream.fileno())
+        return {"schema": "ocean-model-dispatch-reader.v1", "path": str(self._path),
+                "host_id": self.host_id, "authority_id": self.authority_id,
+                "device": opened.st_dev, "inode": opened.st_ino,
+                "writer": native_writer_identity(self._pid)}
 
     def __exit__(self, *exc):
         if self.held:

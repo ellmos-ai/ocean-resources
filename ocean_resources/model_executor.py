@@ -117,16 +117,27 @@ class ModelAPIExecutor:
     def abort_load(self, grant, execution_id, turn_id):
         self._owned(grant, execution_id)
         state = self.arbiter.load_state(grant)
+        committed = False
+        def accept():
+            nonlocal committed
+            if committed:
+                raise Hold("native load abort cannot be committed twice")
+            self.arbiter.abort_model_load(grant, turn_id)
+            committed = True
         if state["phase"] == "PREPARED":
-            observation = self._observe_load(loaded=False, expected_process=state["baseline"]["process"])
-            if observation.resident_bytes != 0:
-                raise Hold("unexpected residency before possible load")
+            def accept_absence(observation):
+                if observation.resident_bytes != 0:
+                    raise Hold("unexpected residency before possible load")
+                accept()
+            self._observe_load(loaded=False, expected_process=state["baseline"]["process"],
+                               accept=accept_absence)
         else:
             # Strict host gate + exact process + terminal ACK/absence, never the
             # legacy warmup helper. An unknown dispatch keeps this call held.
             self.port.abort_load(self.spec, state["baseline"]["process"],
-                                 lambda: self._owned(grant, execution_id))
-        self.arbiter.abort_model_load(grant, turn_id)
+                                 lambda: self._owned(grant, execution_id), accept=accept)
+        if not committed:
+            raise Hold("native inference owner did not commit the model abort")
 
     def checkpoint(self, grant, execution_id):
         self._owned(grant, execution_id)
