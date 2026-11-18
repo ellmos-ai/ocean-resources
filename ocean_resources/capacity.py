@@ -6,17 +6,214 @@ and imported only by the explicit native observation path.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from copy import deepcopy
+import hashlib
 import math
 import os
 from pathlib import Path
 import platform
+import re
+import stat
+import subprocess
 from threading import RLock
 import time
 
-from .contracts import CapacityReadback, Hold, identity, instant, positive
+from .contracts import CapacityReadback, Hold, identity, instant, positive, sha256_hex
 from .host import sample_host
+
+DARWIN_VM_STAT_SOURCE = "apple.platform.vm_stat.v1"
+DARWIN_VM_STAT_PATH = Path("/usr/bin/vm_stat")
+DARWIN_VM_STAT_REQUIREMENT = '=anchor apple and identifier "com.apple.vm_stat"'
+_VM_STAT_HEADER_RE = re.compile(r"^Mach Virtual Memory Statistics: \(page size of ([0-9]+) bytes\)\Z")
+_VM_STAT_LINE_RE = re.compile(r"^([^:]+):\s*([0-9]+)\.\Z")
+
+
+def _power_of_two_page_size(value: object) -> bool:
+    return positive(value) and value >= 4096 and (value & (value - 1)) == 0
+
+
+@dataclass(frozen=True)
+class DarwinVmStatSample:
+    """Single signed Apple platform /usr/bin/vm_stat observation.
+
+    Apple's vm_stat prints ``Pages free`` with ``speculative_count`` already
+    subtracted, whereas Mach/psutil ``available`` equals
+    ``page_size * (free_count + inactive_count)`` where ``free_count`` includes
+    ``speculative_count``. Summing free + speculative + inactive from one
+    platform-binary sample reproduces the exact same physical available metric
+    without XNU's non-platform host_statistics64 cache.
+    """
+    sequence: int
+    page_size: int
+    pages_free: int
+    pages_speculative: int
+    pages_inactive: int
+    pages_wired: int
+    sample_started_ns: int
+    sample_completed_ns: int
+    vm_stat_sha256: str
+    signature_verified: bool
+    os_release: str
+    source: str = DARWIN_VM_STAT_SOURCE
+
+    def __post_init__(self):
+        if self.source != DARWIN_VM_STAT_SOURCE:
+            raise ValueError("unrecognized platform capacity sample source")
+        if self.signature_verified is not True:
+            raise ValueError("platform vm_stat Apple signature must be verified")
+        sha256_hex(self.vm_stat_sha256)
+        if not positive(self.sequence) or not _power_of_two_page_size(self.page_size):
+            raise ValueError("positive sequence and power-of-two page size required")
+        for count in (self.pages_free, self.pages_speculative, self.pages_inactive, self.pages_wired):
+            if type(count) is not int or count < 0:
+                raise ValueError("vm_stat page counters must be non-negative integers")
+        if (not positive(self.sample_started_ns) or not positive(self.sample_completed_ns)
+                or self.sample_started_ns > self.sample_completed_ns):
+            raise ValueError("monotonic nanosecond sample bracket required")
+        if not isinstance(self.os_release, str) or not self.os_release.strip() or len(self.os_release) > 128:
+            raise ValueError("non-empty OS release binding required")
+
+    @property
+    def available_bytes(self) -> int:
+        return self.page_size * (self.pages_free + self.pages_speculative + self.pages_inactive)
+
+    @property
+    def wired_bytes(self) -> int:
+        return self.page_size * self.pages_wired
+
+
+def parse_darwin_vm_stat_output(stdout: str, *, expected_page_size: int) -> dict[str, int]:
+    """Strictly parse one single-shot /usr/bin/vm_stat output."""
+    if not _power_of_two_page_size(expected_page_size):
+        raise Hold("platform_sample_page_size_invalid")
+    if not isinstance(stdout, str) or not stdout or len(stdout) > 65536:
+        raise Hold("platform_sample_schema")
+    lines = stdout.splitlines()
+    header = _VM_STAT_HEADER_RE.fullmatch(lines[0]) if lines else None
+    if header is None or int(header.group(1)) != expected_page_size:
+        raise Hold("platform_sample_header")
+    values: dict[str, int] = {}
+    for line in lines[1:]:
+        match = _VM_STAT_LINE_RE.fullmatch(line)
+        if match is None:
+            raise Hold("platform_sample_schema")
+        key = match.group(1)
+        if key in values:
+            raise Hold("platform_sample_schema")
+        values[key] = int(match.group(2))
+    required = ("Pages free", "Pages speculative", "Pages inactive", "Pages wired down")
+    if any(key not in values for key in required):
+        raise Hold("platform_available_fields_missing")
+    return values
+
+
+def _vm_stat_identity(path: Path, *, require_root_owner: bool) -> tuple[tuple[int, int, int, int], str]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise Hold("platform_sample_binary_unavailable") from exc
+    if (path.is_symlink() or not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_size <= 0 or before.st_size > 8 * 1024 * 1024
+            or (require_root_owner and before.st_uid != 0)):
+        raise Hold("platform_sample_binary_identity")
+    try:
+        raw = path.read_bytes()
+        after = path.lstat()
+    except OSError as exc:
+        raise Hold("platform_sample_binary_unavailable") from exc
+    ident_before = (before.st_dev, before.st_ino, before.st_mtime_ns, before.st_size)
+    ident_after = (after.st_dev, after.st_ino, after.st_mtime_ns, len(raw))
+    if ident_before != ident_after:
+        raise Hold("platform_sample_binary_changed")
+    return ident_before, hashlib.sha256(raw).hexdigest()
+
+
+def verify_darwin_vm_stat_binary(
+    *,
+    expected_sha256: str | None = None,
+    path: Path = DARWIN_VM_STAT_PATH,
+    require_root_owner: bool = True,
+    runner=subprocess.run,
+) -> tuple[tuple[int, int, int, int], str]:
+    """Verify binary identity, optional pinned SHA-256 and strict Apple codesign."""
+    if expected_sha256 is not None:
+        sha256_hex(expected_sha256)
+    ident, digest = _vm_stat_identity(path, require_root_owner=require_root_owner)
+    if expected_sha256 is not None and digest != expected_sha256:
+        raise Hold("vm_stat_binary_changed")
+    try:
+        proc = runner(
+            ["/usr/bin/codesign", "--verify", "--strict", "-R", DARWIN_VM_STAT_REQUIREMENT, str(path)],
+            capture_output=True, text=True, timeout=5,
+        )
+    except Exception as exc:
+        raise Hold("vm_stat_apple_signature_unconfirmed") from exc
+    if getattr(proc, "returncode", None) != 0:
+        raise Hold("vm_stat_apple_signature_unconfirmed")
+    return ident, digest
+
+
+def sample_darwin_vm_stat(
+    *,
+    sequence: int,
+    expected_sha256: str | None = None,
+    timeout: float = 3.0,
+    path: Path = DARWIN_VM_STAT_PATH,
+    require_root_owner: bool = True,
+    runner=subprocess.run,
+    clock_ns=time.monotonic_ns,
+    page_size: int | None = None,
+    os_release: str | None = None,
+) -> DarwinVmStatSample:
+    """Capture one signed Apple platform /usr/bin/vm_stat sample with ns bracketing."""
+    if not positive(sequence):
+        raise Hold("platform_sample_sequence_invalid")
+    if not instant(timeout) or not 0 < timeout <= 10:
+        raise Hold("platform_sample_timeout_invalid")
+    if page_size is None:
+        if platform.system() != "Darwin":
+            raise Hold("darwin_platform_sample_unavailable")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+    if not _power_of_two_page_size(page_size):
+        raise Hold("platform_sample_page_size_invalid")
+    release = platform.release() if os_release is None else os_release
+    if not isinstance(release, str) or not release.strip():
+        raise Hold("platform_sample_os_release_unavailable")
+    ident_before, digest_before = verify_darwin_vm_stat_binary(
+        expected_sha256=expected_sha256,
+        path=path,
+        require_root_owner=require_root_owner,
+        runner=runner,
+    )
+    started_ns = clock_ns()
+    try:
+        proc = runner([str(path)], capture_output=True, text=True, timeout=timeout)
+    except Exception as exc:
+        raise Hold("platform_sample_failed") from exc
+    completed_ns = clock_ns()
+    if getattr(proc, "returncode", None) != 0 or getattr(proc, "stderr", ""):
+        raise Hold("platform_sample_failed")
+    ident_after, digest_after = _vm_stat_identity(path, require_root_owner=require_root_owner)
+    if ident_after != ident_before or digest_after != digest_before:
+        raise Hold("sample_binary_changed")
+    values = parse_darwin_vm_stat_output(proc.stdout, expected_page_size=page_size)
+    try:
+        return DarwinVmStatSample(
+            sequence=sequence,
+            page_size=page_size,
+            pages_free=values["Pages free"],
+            pages_speculative=values["Pages speculative"],
+            pages_inactive=values["Pages inactive"],
+            pages_wired=values["Pages wired down"],
+            sample_started_ns=started_ns,
+            sample_completed_ns=completed_ns,
+            vm_stat_sha256=digest_after,
+            signature_verified=True,
+            os_release=release,
+        )
+    except ValueError as exc:
+        raise Hold("platform_sample_invalid") from exc
 
 
 @dataclass(frozen=True)
@@ -127,12 +324,23 @@ class NativeCapacitySensor:
     constraints are proved. No native queue/service/model is discovered.
     """
 
-    def __init__(self, policy: CapacityPolicy, host_id: str | None = None):
+    def __init__(
+        self,
+        policy: CapacityPolicy,
+        host_id: str | None = None,
+        *,
+        vm_stat_reader=None,
+        use_platform_vm_stat: bool = False,
+        expected_vm_stat_sha256: str | None = None,
+    ):
         self.policy = policy
         self.host_id = identity(platform.node() if host_id is None else host_id)
         self._pid = os.getpid()
         self._sequence = 0
         self._mutex = RLock()
+        self._vm_stat_reader = vm_stat_reader
+        self._use_platform_vm_stat = bool(use_platform_vm_stat)
+        self._expected_vm_stat_sha256 = expected_vm_stat_sha256
         self.last_observation: dict | None = None
 
     def observe(self) -> dict:
@@ -235,11 +443,53 @@ class NativeCapacitySensor:
         return result
 
     def model_load_readback(self):
+        if self._use_platform_vm_stat:
+            return self.platform_model_load_readback(
+                expected_vm_stat_sha256=self._expected_vm_stat_sha256,
+            )
         from .model_loading import ModelLoadCapacity
         result = self.observe()
         if "model_load_capacity" not in result:
             raise Hold("native model load capacity is unavailable")
         return ModelLoadCapacity(CapacityReadback(**result["reading"]), **result["model_load_capacity"])
+
+    def platform_model_load_readback(self, *, expected_vm_stat_sha256: str | None = None):
+        """Return a ModelLoadCapacity backed by one signed Apple /usr/bin/vm_stat sample."""
+        from .model_loading import ModelLoadCapacity
+
+        if os.getpid() != self._pid:
+            raise Hold("foreign-host-or-process")
+        with self._mutex:
+            result = self.observe()
+            if "model_load_capacity" not in result:
+                raise Hold("native model load capacity is unavailable")
+            reading = CapacityReadback(**result["reading"])
+            if self._vm_stat_reader is not None:
+                vm_stat = self._vm_stat_reader(sequence=reading.sequence)
+            else:
+                vm_stat = sample_darwin_vm_stat(
+                    sequence=reading.sequence,
+                    expected_sha256=expected_vm_stat_sha256,
+                )
+            if not isinstance(vm_stat, DarwinVmStatSample) or vm_stat.sequence != reading.sequence:
+                raise Hold("platform capacity sample sequence or schema invalid")
+            finished = time.monotonic()
+            if not instant(finished) or not 0 <= finished - reading.observed_at <= self.policy.max_age_seconds:
+                raise Hold("stale-observation-window")
+            physical_available = vm_stat.available_bytes
+            if physical_available < self.policy.reserve_ram_bytes:
+                raise Hold("insufficient-observed-headroom")
+            updated_reading = replace(
+                reading,
+                available_ram_bytes=physical_available - self.policy.reserve_ram_bytes,
+            )
+            return ModelLoadCapacity(
+                updated_reading,
+                physical_available,
+                self.policy.reserve_ram_bytes,
+                result["model_load_capacity"]["pressure_level"],
+                platform_sample=vm_stat,
+            )
 
     def __call__(self) -> CapacityReadback:
         return CapacityReadback(**self.observe()["reading"])

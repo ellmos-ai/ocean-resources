@@ -129,6 +129,37 @@ reclaimable pages cannot be counted twice as both available and already resident
 The current BACH port deliberately supplies no such credit and cannot activate
 staged loading.
 
+## Physical ResidentCredit v2 (`darwin-wired-metal-nocopy-vmstat.v2`)
+
+For cooperative Apple Silicon runners, `ocean_resources.model_loading` and
+`ocean_resources.capacity` implement the opt-in v2 physical attribution contract:
+
+1. **Owned Wired Backings (`WiredBacking`, `WiredEpoch`, `DarwinWiredWeightRunner`):**
+   Model weights from `.safetensors` files are loaded into private anonymous
+   `mmap(MAP_PRIVATE | MAP_ANON)` regions with `minherit(..., VM_INHERIT_NONE)`
+   and `mlock(...)`, bound zero-copy to Metal shared buffers via
+   `newBufferWithBytesNoCopy:length:options:deallocator:`, and verified by a
+   Metal compute pass reading every 32-bit word and page boundary. Only whole
+   initialized weight pages (`raw_bytes // page_size`) count; aliased tensor
+   views sharing an `allocation_id` count once and conflicting claims hold.
+2. **Signed Platform Capacity Sample (`DarwinVmStatSample`, `sample_darwin_vm_stat`):**
+   Because XNU caches `host_statistics64` for non-platform processes, v2 credits
+   require a single verified `/usr/bin/vm_stat` platform-binary sample checked
+   with `codesign --verify --strict -R '=anchor apple and identifier "com.apple.vm_stat"'`
+   and binary identity readback before and after invocation. The projection
+   `A = page_size * (Pages_free + Pages_speculative + Pages_inactive)` matches
+   `psutil`'s available metric on the same kernel state and must bracket cleanly
+   after wire completion (`wire_completed_ns <= sample_started_ns <= sample_completed_ns`).
+3. **Three-Point Epoch Fencing & Durable Retirement (`WiredResidentCreditProof`, `permit_unwire`):**
+   The host port proves `before_sample_epoch == after_sample_epoch == pre_commit_epoch`
+   bound to exact `WiredScope` (boot, listener, runner, workload, digest,
+   context, authority ID, grant generation fence and turn ID). Controlled release
+   of Metal buffers, `munlock` and `munmap` is refused unless `permit_unwire`
+   receives an exact `DurableRetirement("RETIRED", scope, generation)`.
+
+Stock Ollama 0.33.3 does not export this cooperative wire/generation proof and
+remains at `supports_load_pending = False` with `0` bytes credited.
+
 ## Failure and locking boundaries
 
 The controller transition lock serializes native lifecycle changes. Native ports

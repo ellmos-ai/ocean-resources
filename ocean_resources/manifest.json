@@ -100,5 +100,13 @@
     "scope": "CPU-owned processes only; external model/GPU residency remains unapproved",
     "revocation": "re-read pinned bytes before acquire and execution; checkpoint/stop/exit/release remain available",
     "cli": "profiles validates explicit local pins read-only, without starting work"
+  },
+  "wired_resident_credit": {
+    "source": "darwin-wired-metal-nocopy-vmstat.v2",
+    "capacity_sensor": "signed Apple platform /usr/bin/vm_stat (A = page_size * (Pages_free + Pages_speculative + Pages_inactive))",
+    "fencing": "3-point WiredEpoch equality (before sample, after sample, pre-commit) bound to listener, runner, workload, grant fence and turn",
+    "runner": "cooperative DarwinWiredWeightRunner (.safetensors -> anonymous private MAP_ANON + VM_INHERIT_NONE + mlock -> Metal bytesNoCopy + GPU read verification)",
+    "retirement": "permit_unwire requires exact DurableRetirement(RETIRED, scope, generation) before Metal release, munlock and munmap",
+    "stock_ollama_status": "supports_load_pending remains False; zero credit granted without cooperative wired proof"
   }
 }
