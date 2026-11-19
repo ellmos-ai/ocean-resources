@@ -23,6 +23,27 @@ from .ram_distributor import (
     UserProximity,
     WatchdogHysteresisPolicy,
 )
+from .capacity import (
+    DARWIN_VM_STAT_SOURCE,
+    DarwinVmStatSample,
+    parse_darwin_vm_stat_output,
+    sample_darwin_vm_stat,
+    verify_darwin_vm_stat_binary,
+)
+from .model_loading import (
+    WIRED_CREDIT_SOURCE,
+    DarwinWiredWeightRunner,
+    DurableRetirement,
+    SafetensorsTensorInfo,
+    WiredBacking,
+    WiredEpoch,
+    WiredResidentCreditProof,
+    WiredScope,
+    WiredWeightRegion,
+    build_wired_resident_credit,
+    parse_safetensors_header,
+    permit_unwire,
+)
 from .inference_queue_policy import (
     MAX_CONSECUTIVE_FOREGROUND,
     QueuePolicyError,
@@ -46,6 +67,12 @@ __all__ = [
     "ConsumerCapability", "DistributorRequest", "FallbackDecision",
     "RAMDistributor", "UserProximity", "WatchdogHysteresisPolicy",
     "CooldownDecision", "RunCooldownGate", "RunCooldownPolicy",
+    "DARWIN_VM_STAT_SOURCE", "DarwinVmStatSample", "parse_darwin_vm_stat_output",
+    "sample_darwin_vm_stat", "verify_darwin_vm_stat_binary",
+    "WIRED_CREDIT_SOURCE", "DarwinWiredWeightRunner", "DurableRetirement",
+    "SafetensorsTensorInfo", "WiredBacking", "WiredEpoch", "WiredResidentCreditProof",
+    "WiredScope", "WiredWeightRegion", "build_wired_resident_credit",
+    "parse_safetensors_header", "permit_unwire",
     "MAX_CONSECUTIVE_FOREGROUND", "QueuePolicyError", "QueuePriority",
     "QueueSelection", "QueueTicket", "SelectionReason", "select_next_ticket",
 ]
