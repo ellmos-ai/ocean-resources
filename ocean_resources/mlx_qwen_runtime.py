@@ -131,6 +131,10 @@ class QwenTextRuntime:
             self._started = True
             values = self._load_arrays(check_owned)
             mx, nn = self._mx, self._nn
+            # MLX's lazy operations remember the creating thread's stream.
+            # A loopback request can load on a different thread from inference.
+            check_owned()
+            mx.eval(*values.values())
 
             class NVFP4Linear(nn.Module):
                 def __init__(self, weight, scales, factor):

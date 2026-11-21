@@ -14,7 +14,7 @@ SCHEMA = "ocean-host-transport.v1"
 LIMIT = 1024 * 1024
 OPERATIONS = frozenset({"status", "submit", "submit_leased", "renew", "cancel", "request_status",
                         "begin_turn", "end_turn", "override", "finish", "tick",
-                        "submit_model_load", "begin_model_load", "complete_model_load"})
+                        "submit_model_load", "begin_model_load", "materialize_model_load", "complete_model_load"})
 
 
 def decode_json(raw: bytes) -> dict:

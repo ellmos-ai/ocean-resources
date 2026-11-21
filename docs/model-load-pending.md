@@ -215,6 +215,13 @@ For ordinary return and for abort, the port drains MLX, waits for durable
 retirement when required, and separately reports absence. This port requires
 the `native` dependency group and the optional MLX extension.
 
+A configured loopback client can invoke `materialize_model_load(grant, turn_id)`
+after begin. The host retains the running operation when the connection times
+out. A retry on the same exact grant and turn reports `LOADING`, `READY` or
+`FAILED` without starting a second load. `READY` means the weight load ended.
+The normal completion operation must still verify the native proof before
+inference. Host polling remains available during materialization.
+
 
 
 For a verified wired load, the native port implements `unload_wired(spec,

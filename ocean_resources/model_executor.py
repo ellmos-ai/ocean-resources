@@ -104,6 +104,18 @@ class ModelAPIExecutor:
         observation = self._observe_load(loaded=False)
         return self.arbiter.begin_model_load(grant, self.spec, turn_id, observation)
 
+    @property
+    def supports_materialization(self):
+        return callable(getattr(self.port, "materialize", None))
+
+    def materialize(self, grant, execution_id, permit, *, client_id):
+        self._owned(grant, execution_id)
+        if not self.supports_materialization:
+            raise Hold("native port does not materialize in process")
+        self.port.materialize(self.spec, permit, authority_id=grant.authority_id,
+                              host_id=self.arbiter.authority.host_id, client_id=client_id,
+                              capacity_reader=self.arbiter.observe_model_capacity)
+
     def complete_load(self, grant, execution_id, turn_id):
         self._owned(grant, execution_id)
         state = self.arbiter.load_state(grant)

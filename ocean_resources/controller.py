@@ -131,6 +131,7 @@ class HostController(ClientLeaseLifecycle):
         self._ended_turns: set[str] = set()
         self._return: tuple[str, bool] | None = None
         self._transition: dict | None = None
+        self._materialization: tuple[Grant, str, str] | None = None
         self._error: str | None = None
         self._audit_fault = False
         self._pending_audit: dict | None = None
@@ -252,6 +253,46 @@ class HostController(ClientLeaseLifecycle):
         finally:
             self._transition_lock.release()
 
+    def materialize_model_load(self, client_id, token, grant, turn_id):
+        """Run at most one native load per owned turn without blocking host polling."""
+        client = self._authenticate(client_id, token)
+        identity(turn_id)
+        with self._mutex:
+            self._owned_model_load(client, grant)
+        loader, execution_id = self.facade.model_loader(grant)
+        if not loader.supports_materialization:
+            raise Hold("native model port does not support in-process materialization")
+        if not self._transition_lock.acquire(blocking=False):
+            raise Hold("controller handoff is in progress")
+        try:
+            with self._mutex:
+                entry = self._owned_model_load(client, grant)
+                state = self.arbiter.load_state(grant)
+                if (self._materialization is not None and self._materialization[:2] == (grant, turn_id)
+                        and state["turn_id"] == turn_id):
+                    return {"state": self._materialization[2], "grant": asdict(grant), "turn_id": turn_id}
+                if (state["phase"] != "MAY_LOAD" or state["turn_id"] != turn_id or turn_id not in self._turns
+                        or entry["terminal"] or self._now() >= entry["receipt"].expires_at
+                        or self._return or self._audit_fault):
+                    raise Hold("in-process materialization has no live load permit")
+                self._audit("model-materialization-requested", grant=asdict(grant), turn_id=turn_id)
+                permit = {**state, "grant": asdict(grant),
+                          "writer_readback": self.arbiter.authority.model_dispatch_reference()}
+                self._materialization = (grant, turn_id, "LOADING")
+        finally:
+            self._transition_lock.release()
+
+        terminal = "FAILED"
+        try:
+            loader.materialize(grant, execution_id, permit, client_id=client_id)
+            terminal = "READY"
+        finally:
+            with self._mutex:
+                self._materialization = (grant, turn_id, terminal)
+                if terminal == "FAILED":
+                    self.arbiter.hold_model_load(grant, "native-model-materialization-unproved")
+        return {"state": terminal, "grant": asdict(grant), "turn_id": turn_id}
+
     def complete_model_load(self, client_id, token, grant, turn_id, successful):
         client = self._authenticate(client_id, token)
         identity(turn_id)
@@ -263,6 +304,10 @@ class HostController(ClientLeaseLifecycle):
             with self._mutex:
                 entry = self._owned_model_load(client, grant)
                 state = self.arbiter.load_state(grant)
+                if self._materialization == (grant, turn_id, "LOADING"):
+                    raise Hold("in-process model materialization is still active")
+                if successful and self._materialization == (grant, turn_id, "FAILED"):
+                    raise Hold("in-process model materialization requires native recovery")
                 if turn_id in self._ended_turns:
                     if (state["turn_id"] == turn_id and
                             state["phase"] == ("VERIFIED" if successful else "ABORTED")):

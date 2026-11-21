@@ -317,6 +317,61 @@ def pending_http(pending_host):
         assert not thread.is_alive()
 
 
+def test_http_materialization_has_one_native_worker_and_independent_readbacks(pending_http, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    import time
+
+    ctx, client = pending_http
+    _ctl, _native, _operator, arbiter, port, free, *_ = ctx
+    entered, resume = Event(), Event()
+    permits = []
+
+    def materialize(actual, permit, **authority):
+        assert permit["spec"]["digest"] == actual.digest
+        assert authority["client_id"] == client.client_id
+        assert authority["authority_id"] == client.authority_id
+        assert authority["host_id"] == client.host_id
+        permits.append(permit)
+        entered.set()
+        assert resume.wait(5)
+        port.resident, free[0] = 19 * GIB, 4 * GIB
+
+    monkeypatch.setattr(port, "materialize", materialize, raising=False)
+    request = SlotRequest("native-materialize", "model", "bach-model", client.host_id, "idempotent", interactive=True)
+    lease = client.submit_model_load(request, 60)
+    deadline = time.monotonic() + 5
+    while True:
+        state = client.request_status(lease.request_id)
+        if state["state"] == "LOAD_PENDING":
+            break
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    grant = Grant(**state["grant"])
+    client.begin_model_load(grant, "materialize")
+    short_client = replace(client, timeout_seconds=.25)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        original = pool.submit(short_client.materialize_model_load, grant, "materialize")
+        try:
+            assert entered.wait(5)
+            with pytest.raises(Hold):
+                original.result(timeout=5)
+            assert client.materialize_model_load(grant, "materialize")["state"] == "LOADING"
+            assert client.request_status(lease.request_id)["state"] == "LOAD_PENDING"
+            with pytest.raises(Hold):
+                client.complete_model_load(grant, "materialize", True)
+        finally:
+            resume.set()
+    deadline = time.monotonic() + 5
+    while client.materialize_model_load(grant, "materialize")["state"] != "READY":
+        assert time.monotonic() < deadline
+        time.sleep(.01)
+    assert len(permits) == 1
+    assert client.complete_model_load(grant, "materialize", True)["state"] == "RUNNING"
+    assert client.finish(grant)["state"] == "IDLE"
+    assert arbiter.status()["torch"] is None
+
+
 def test_real_http_staged_load_then_ordinary_turn_reuses_one_identity(pending_http):
     import asyncio
 

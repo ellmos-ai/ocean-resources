@@ -95,6 +95,14 @@ class HostClient:
     def begin_model_load(self, grant, turn_id):
         return self.call("begin_model_load", {"grant": asdict(grant), "turn_id": turn_id})
 
+    def materialize_model_load(self, grant, turn_id):
+        identity(turn_id)
+        value = self.call("materialize_model_load", {"grant": asdict(grant), "turn_id": turn_id})
+        if (value.get("grant") != asdict(grant) or value.get("turn_id") != turn_id
+                or value.get("state") not in {"LOADING", "READY", "FAILED"}):
+            raise Hold("host returned an unrelated materialization readback")
+        return value
+
     def complete_model_load(self, grant, turn_id, successful):
         value = self.call("complete_model_load", {"grant": asdict(grant), "turn_id": turn_id,
                                                    "successful": successful})
