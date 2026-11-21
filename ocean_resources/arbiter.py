@@ -15,7 +15,9 @@ from threading import RLock
 from copy import deepcopy
 from typing import Callable
 
-from .model_loading import DurableRetirement, ModelLoadLifecycle, WiredEpoch, verified_wired_epoch
+from .model_loading import (
+    DurableRetirement, ModelLoadLifecycle, WiredEpoch, verified_wired_epoch, wired_epoch_commitment,
+)
 from .authority import HostWriterAuthority
 from .profiles import ReviewedProfileGate
 from .contracts import (
@@ -566,7 +568,7 @@ class HostLocalArbiter(ModelLoadLifecycle):
         admitted = verified_wired_epoch(state)
         evidence = active.execution_evidence
         if (not active.return_requested or evidence is None or not isinstance(epoch, WiredEpoch)
-                or admitted != json.loads(json.dumps(asdict(epoch)))):
+                or admitted != wired_epoch_commitment(epoch)):
             raise Hold("no exact wired epoch eligible for retirement")
         self.require_model_evidence(grant, execution_id, evidence["workload_sha256"],
                                     evidence["model"], evidence["digest"], phase="checkpointed")

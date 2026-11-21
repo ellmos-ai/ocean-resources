@@ -167,6 +167,10 @@ For a verified wired load, the native port implements `unload_wired(spec,
 retire_epoch)`. It passes the exact admitted epoch to the callback after the
 controller has requested return and recorded the execution checkpoint. The
 callback persists and reads back the epoch retirement before the port unwires.
+The loaded model's journal records the admitted epoch scope, generation,
+backing count and SHA-256 commitment after validating all three epoch samples.
+This keeps the writer record bounded for checkpoints with many weight buffers.
+The exact epoch must still match that commitment before retirement.
 The controller keeps the resource grant until the native port separately
 reports zero residency and the arbiter accepts a subsequent capacity sample.
 The port must make unload retries idempotent, including retries after native

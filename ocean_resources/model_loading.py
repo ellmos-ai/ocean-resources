@@ -182,14 +182,29 @@ def permit_unwire(epoch: WiredEpoch, readback: DurableRetirement | None) -> None
         raise Hold("retirement has no exact durable readback")
 
 
+def wired_epoch_commitment(epoch: WiredEpoch | dict) -> dict:
+    """Commit to the full epoch without journaling every backing."""
+    raw = asdict(epoch) if isinstance(epoch, WiredEpoch) else epoch
+    encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {
+        "scope": raw["scope"],
+        "generation": raw["generation"],
+        "backing_count": len(raw["backings"]),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
 def verified_wired_epoch(load_state):
-    """Return the exact journaled epoch from a completed wired admission."""
+    """Return the journaled identity from a completed wired admission."""
     if load_state is None or load_state["phase"] != "VERIFIED":
         return None
     credit = load_state["completion"]["observation"]["credit"]
     if credit is None or credit["source"] != WIRED_CREDIT_SOURCE:
         return None
-    return credit["wired_proof"]["pre_commit_epoch"]
+    proof = credit["wired_proof"]
+    if proof.get("schema") == "ocean-wired-epoch-commitment.v1":
+        return proof["epoch"]
+    return wired_epoch_commitment(proof["pre_commit_epoch"])
 
 
 @dataclass(frozen=True)
@@ -459,6 +474,15 @@ class ModelLoadLifecycle:
         if (cap.reading.available_ram_bytes < remaining
                 or observation.available_ram_bytes < cap.reserve_ram_bytes + observation.normal_headroom_bytes):
             raise Hold("loaded model lacks normal reserve and provable remaining peak capacity")
+        if observation.credit is not None and observation.credit.source == WIRED_CREDIT_SOURCE:
+            epoch = observation.credit.wired_proof.pre_commit_epoch
+            recorded = asdict(replace(observation, credit=replace(observation.credit, wired_proof=None)))
+            recorded["credit"]["wired_proof"] = {
+                "schema": "ocean-wired-epoch-commitment.v1",
+                "epoch": wired_epoch_commitment(epoch),
+            }
+        else:
+            recorded = asdict(observation)
         # A native read can block; repeat immutable approval and expiry checks.
         if self._load_profile(socket)["profile_sha256"] != state["profile_sha256"]:
             raise Hold("reviewed model profile changed during completion")
@@ -469,7 +493,7 @@ class ModelLoadLifecycle:
                                   active.metric_sequence, loading=False)):
             raise Hold("native load proof expired before durable commit")
         previous = deepcopy(state)
-        state.update(phase="VERIFIED", completion={"observation": _json_roundtrip(asdict(observation)),
+        state.update(phase="VERIFIED", completion={"observation": _json_roundtrip(recorded),
             "credited_bytes": credit, "remaining_ram_bytes": remaining}, reason=None)
         active.metric_sequence = cap.reading.sequence
         try:

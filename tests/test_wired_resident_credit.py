@@ -321,14 +321,18 @@ def _start_and_begin(h, turn_id="turn-1"):
 
 # --- 1. Production ResidentCredit v2 contract tests (full arbiter lifecycle) ---
 
-def test_bound_wired_epoch_credits_unique_pages_and_promotes_to_running(wired_host):
+@pytest.mark.parametrize("backing_count", [2, 946])
+def test_bound_wired_epoch_credits_unique_pages_and_promotes_to_running(wired_host, backing_count):
     grant = _start_and_begin(wired_host)
     wired_host.state["resident"] = 12 * GIB
     wired_host.available_pages[0] = (4 * GIB + 512 * 1024 * 1024) // PAGE
     scope = wired_host.make_scope(grant, "turn-1")
-    backing = wired_host.make_backing()
-    # Two aliased views of the exact same physical allocation count once.
-    epoch = WiredEpoch(scope, 1, 1_500, (backing, backing))
+    unique = backing_count - 1
+    pages, remainder = divmod((12 * GIB) // PAGE, unique)
+    backings = tuple(wired_host.make_backing(pages + int(i < remainder), allocation_id=f"region-{i}")
+                     for i in range(unique))
+    # Aliased views still count only once.
+    epoch = WiredEpoch(scope, 1, 1_500, (*backings, backings[0]))
     wired_host.state["credit_builder"] = lambda cap: build_wired_resident_credit(
         scope=scope,
         before_sample_epoch=epoch,
@@ -343,7 +347,14 @@ def test_bound_wired_epoch_credits_unique_pages_and_promotes_to_running(wired_ho
     assert status["state"] == "RUNNING"
     saved = wired_host.writer.unresolved()
     assert saved["load_state"]["phase"] == "VERIFIED"
-    assert saved["load_state"]["completion"]["credited_bytes"] == 12 * GIB
+    completion = saved["load_state"]["completion"]
+    assert completion["credited_bytes"] == 12 * GIB
+    proof = completion["observation"]["credit"]["wired_proof"]
+    assert proof["schema"] == "ocean-wired-epoch-commitment.v1"
+    assert proof["epoch"]["backing_count"] == backing_count
+    epoch_bytes = json.dumps(asdict(epoch), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert proof["epoch"]["sha256"] == hashlib.sha256(epoch_bytes).hexdigest()
+    assert wired_host.writer._path.stat().st_size < 16 * 1024
 
 
 def _expect_complete_hold(wired_host, grant, expected_inner_substring: str, turn_id: str = "turn-1"):
@@ -958,6 +969,9 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 epoch = live_scope_box["epoch"]
                 with pytest.raises(Hold, match="no exact wired epoch"):
                     retire_epoch(replace(epoch, generation=epoch.generation + 1))
+                changed_backing = replace(epoch.backings[-1], weights_sha256="0" * 64)
+                with pytest.raises(Hold, match="no exact wired epoch"):
+                    retire_epoch(replace(epoch, backings=(*epoch.backings[:-1], changed_backing)))
                 receipt = retire_epoch(epoch)
                 assert writer.unresolved()["load_state"]["retirement"] == asdict(receipt)
                 if "cleanup" not in live_scope_box:
