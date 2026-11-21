@@ -165,16 +165,26 @@ def test_no_running_or_release_on_incomplete_load_proof(pending_host, failure):
     grant = Grant(**status["torch"])
     ctl.begin_model_load(client.client_id, client.token, grant, "attempt")
     port.resident, free[0] = 19 * GIB, 4 * GIB
-    if failure == "reserve": free[0] = 3 * GIB
-    if failure == "rss": port.rss = 21 * GIB
-    if failure == "identity": port.identity = replace(port.identity, created_at=11.0)
-    if failure == "pressure": sensor.pressure = port.pressure = 2
-    if failure == "swap": port.swap = 9 * GIB
-    if failure == "unknown": port.unknown = True
-    if failure == "expired": now[0] = 1100
-    if failure == "unattributed": port.credit = False
-    if failure == "context": port.context = 32768
-    if failure == "api_peak": port.resident = 23 * GIB
+    if failure == "reserve":
+        free[0] = 3 * GIB
+    if failure == "rss":
+        port.rss = 21 * GIB
+    if failure == "identity":
+        port.identity = replace(port.identity, created_at=11.0)
+    if failure == "pressure":
+        sensor.pressure = port.pressure = 2
+    if failure == "swap":
+        port.swap = 9 * GIB
+    if failure == "unknown":
+        port.unknown = True
+    if failure == "expired":
+        now[0] = 1100
+    if failure == "unattributed":
+        port.credit = False
+    if failure == "context":
+        port.context = 32768
+    if failure == "api_peak":
+        port.resident = 23 * GIB
     with pytest.raises(Hold):
         ctl.complete_model_load(client.client_id, client.token, grant, "attempt", True)
     assert arbiter.status()["torch"] == asdict(grant)
@@ -206,7 +216,8 @@ def test_terminal_abort_fences_delayed_begin_without_a_native_post(pending_host)
 def test_missing_explicit_client_capability_cannot_request_load(pending_host):
     ctl, client, *_ = pending_host
     ctl._clients[client.client_id] = replace(client, allow_model_load=False)
-    with pytest.raises(Hold): start(pending_host)
+    with pytest.raises(Hold):
+        start(pending_host)
 
 
 def test_two_live_load_requests_for_the_same_socket_do_not_race(pending_host):
