@@ -713,6 +713,25 @@ class WiredWeightRegion:
     gpu_verified: bool = False
 
 
+@dataclass(frozen=True, eq=False)
+class WiredWeightLease:
+    """Identity-scoped access to a runner-owned, immutable weight mapping."""
+
+    tensor_name: str
+    address: int
+    raw_bytes: int
+
+
+def _serialized_wired_runner(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if self._pid != os.getpid():
+            raise Hold("foreign_wired_runner_process")
+        with self._wire_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 @contextmanager
 def _metal_autorelease_pool(runtime):
     pool = runtime.objc.objc_autoreleasePoolPush()
@@ -744,6 +763,9 @@ class DarwinWiredWeightRunner:
     def __init__(self, *, max_total_bytes: int = 512 * 1024 * 1024):
         if not positive(max_total_bytes):
             raise ValueError("positive max_total_bytes required")
+        self._pid = os.getpid()
+        self._wire_lock = threading.Lock()
+        self._weight_leases: set[WiredWeightLease] = set()
         self._rt = _get_metal_runtime()
         with _metal_autorelease_pool(self._rt):
             self._max_total_bytes = max_total_bytes
@@ -822,6 +844,30 @@ class DarwinWiredWeightRunner:
     def regions(self) -> dict[str, WiredWeightRegion]:
         return dict(self._regions)
 
+    @_serialized_wired_runner
+    def borrow_weight(self, tensor_name: str) -> WiredWeightLease:
+        """Hold a backing until the inference runtime releases its last reference.
+
+        The borrower must synchronize GPU work and dispose of every native
+        reference before returning the lease. Losing the lease holds teardown.
+        """
+        if self._retired or self._teardown_started or self._gpu_commit_uncertain:
+            raise Hold("wired_runner_unavailable_for_borrow")
+        region = self._regions.get(tensor_name) if isinstance(tensor_name, str) else None
+        if region is None:
+            raise Hold("unknown_wired_weight")
+        lease = WiredWeightLease(region.tensor_name, region.address, region.raw_bytes)
+        self._weight_leases.add(lease)
+        return lease
+
+    @_serialized_wired_runner
+    def release_weight(self, lease: WiredWeightLease) -> None:
+        """Acknowledge that the borrower no longer retains the backing."""
+        if not isinstance(lease, WiredWeightLease) or lease not in self._weight_leases:
+            raise Hold("unowned_or_released_wired_weight_lease")
+        self._weight_leases.remove(lease)
+
+    @_serialized_wired_runner
     @_with_metal_autorelease_pool
     def load_safetensors(
         self,
@@ -928,6 +974,7 @@ class DarwinWiredWeightRunner:
         self._wire_completed_ns = time.monotonic_ns()
         return loaded
 
+    @_serialized_wired_runner
     def register_tensor_view(self, view_name: str, base_tensor_name: str) -> None:
         """Register an aliased view sharing the exact physical allocation_id of base_tensor_name."""
         if self._retired or self._active_epoch is not None:
@@ -940,6 +987,7 @@ class DarwinWiredWeightRunner:
             raise Hold("duplicate_view_name")
         self._views[view_name] = base_tensor_name
 
+    @_serialized_wired_runner
     @_with_metal_autorelease_pool
     def verify_gpu_weight_read(self, tensor_name: str, *, timeout: float = 15.0) -> dict:
         """Execute a Metal compute pass reading every 32-bit word and page boundary of a wired tensor."""
@@ -1039,6 +1087,7 @@ class DarwinWiredWeightRunner:
                 self._rt.send(None, meta_buf, "release")
                 self._rt.send(None, out_buf, "release")
 
+    @_serialized_wired_runner
     def export_epoch(self, scope: WiredScope) -> WiredEpoch:
         """Export the immutable WiredEpoch bound to scope once all tensors are GPU-verified."""
         if self._retired:
@@ -1083,6 +1132,8 @@ class DarwinWiredWeightRunner:
         if self._gpu_commit_uncertain:
             raise Hold("gpu_terminal_unconfirmed_no_manual_unmap")
         self._teardown_started = True
+        if self._weight_leases:
+            raise Hold("wired_weight_leases_still_active")
         with _metal_autorelease_pool(self._rt):
             while self._refs:
                 self._rt.send(None, self._refs[-1], "release")
@@ -1135,6 +1186,7 @@ class DarwinWiredWeightRunner:
             "cleanup_verified": True,
         }
 
+    @_serialized_wired_runner
     def retire_and_unwire(self, readback: DurableRetirement | None) -> dict:
         """Unwire and free Metal/VM mappings ONLY after durable RETIRED readback."""
         if self._retired:
@@ -1151,6 +1203,7 @@ class DarwinWiredWeightRunner:
             raise Hold("wire_epoch_cleanup_order_unconfirmed")
         return audit
 
+    @_serialized_wired_runner
     def emergency_teardown(self) -> dict:
         """Clean up aborted pre-credit setup; never bypass a published epoch."""
         if self._retired:

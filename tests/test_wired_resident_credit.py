@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import ctypes as C
 import hashlib
 import json
 import os
@@ -770,6 +771,23 @@ def test_wired_teardown_resumes_after_partial_failure(monkeypatch, failing_call)
         )
         events[address, page] = [1]
 
+    first = runner.borrow_weight("first")
+    duplicate = runner.borrow_weight("first")
+    assert first is not duplicate
+    assert (first.address, first.raw_bytes) == (page, page)
+    with pytest.raises(Hold, match="unowned_or_released"):
+        runner.release_weight(model_loading.WiredWeightLease("first", page, page))
+    runner.release_weight(first)
+    with pytest.raises(Hold, match="unowned_or_released"):
+        runner.release_weight(first)
+    with pytest.raises(Hold, match="wired_weight_leases_still_active"):
+        runner.emergency_teardown()
+    assert not calls
+    assert set(events) == {(page, page), (2 * page, page)}
+    with pytest.raises(Hold, match="unavailable_for_borrow"):
+        runner.borrow_weight("first")
+    runner.release_weight(duplicate)
+
     with pytest.raises(Hold, match=f"{failing_call}_failed:second"):
         runner.emergency_teardown()
     assert runner.retired is False
@@ -1025,8 +1043,17 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 runner.retire_and_unwire(DurableRetirement("RECOVERY_HOLD", live_scope, runner.generation))
             assert runner.retired is False
 
-            # Only durable RETIRED readback unlocks Metal deallocation -> munlock -> munmap.
-            audit = runner.retire_and_unwire(DurableRetirement("RETIRED", live_scope, runner.generation))
+            retirement = DurableRetirement("RETIRED", live_scope, runner.generation)
+            lease = runner.borrow_weight("block0.mlp.weight")
+            try:
+                with pytest.raises(Hold, match="wired_weight_leases_still_active"):
+                    runner.retire_and_unwire(retirement)
+                assert C.c_uint32.from_address(lease.address).value == 0x11223344
+            finally:
+                runner.release_weight(lease)
+
+            # Durable RETIRED readback and drained borrowers allow native cleanup.
+            audit = runner.retire_and_unwire(retirement)
             assert audit["cleanup_verified"] is True
             assert audit["regions_released"] == 2
             assert runner.retired is True

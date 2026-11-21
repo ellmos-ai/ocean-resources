@@ -157,6 +157,12 @@ For cooperative Apple Silicon runners, `ocean_resources.model_loading` and
    of Metal buffers, `munlock` and `munmap` is refused unless `permit_unwire`
    receives an exact `DurableRetirement("RETIRED", scope, generation)`.
 
+An in-process inference runtime can use `borrow_weight` to hold a backing
+across asynchronous GPU work. It returns the same lease with `release_weight`
+after the last native reference has gone away. Authorized teardown closes
+borrowing and waits for outstanding leases before releasing any Metal or VM
+resource. The caller retries teardown after the leases drain.
+
 Stock Ollama 0.33.3 does not export this cooperative wire/generation proof and
 remains at `supports_load_pending = False` with `0` bytes credited.
 
