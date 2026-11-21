@@ -116,6 +116,24 @@ class ModelAPIExecutor:
                               host_id=self.arbiter.authority.host_id, client_id=client_id,
                               capacity_reader=self.arbiter.observe_model_capacity)
 
+    @property
+    def supports_generation(self):
+        return callable(getattr(self.port, "generate", None))
+
+    def generate(self, grant, execution_id, prompt, max_new_tokens, stop_tokens, check_owned):
+        def ready():
+            check_owned()
+            self._owned(grant, execution_id)
+
+        if not self.supports_generation or len(prompt) + max_new_tokens > self.spec.context_tokens:
+            raise Hold("native generation or its context limit is unavailable")
+        ready()
+        result = self.port.generate(self.spec, prompt, max_new_tokens, ready, stop_tokens=stop_tokens)
+        if (not isinstance(result, tuple) or len(result) > max_new_tokens
+                or any(type(token) is not int or not 0 <= token <= 0x7fffffff for token in result)):
+            raise Hold("native generation returned invalid tokens")
+        return result
+
     def complete_load(self, grant, execution_id, turn_id):
         self._owned(grant, execution_id)
         state = self.arbiter.load_state(grant)

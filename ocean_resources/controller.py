@@ -7,13 +7,14 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from copy import deepcopy
+from hashlib import sha256
 import json
 import os
 import secrets
 from threading import Lock, RLock
 
 from .adapters import BACHFacade
-from .contracts import Grant, Hold, Override, SlotRequest, identity, instant
+from .contracts import Grant, Hold, Override, SlotRequest, identity, instant, positive
 from .client_leases import ClientLeaseLifecycle
 
 
@@ -97,6 +98,19 @@ class ControllerAudit:
             os.fsync(stream.fileno())
 
 
+@dataclass
+class _Generation:
+    grant: Grant
+    turn_id: str
+    input_sha256: str
+    state: str = "RUNNING"
+    tokens: tuple[int, ...] | None = None
+
+    def readback(self):
+        return {"grant": asdict(self.grant), "turn_id": self.turn_id,
+                "state": self.state, "tokens": list(self.tokens) if self.tokens is not None else None}
+
+
 class HostController(ClientLeaseLifecycle):
     """Single host-loop controller. Callbacks run outside its state mutex.
 
@@ -132,6 +146,7 @@ class HostController(ClientLeaseLifecycle):
         self._return: tuple[str, bool] | None = None
         self._transition: dict | None = None
         self._materialization: tuple[Grant, str, str] | None = None
+        self._generation: _Generation | None = None
         self._error: str | None = None
         self._audit_fault = False
         self._pending_audit: dict | None = None
@@ -362,6 +377,55 @@ class HostController(ClientLeaseLifecycle):
             self._turns.add(turn_id)
             self._activity = now
 
+    def generate_model(self, client_id, token, grant, turn_id, prompt, max_new_tokens, stop_tokens):
+        """Execute one exact native generation per admitted interactive turn."""
+        client = self._authenticate(client_id, token)
+        identity(turn_id)
+        if (not isinstance(prompt, list) or not prompt or not isinstance(stop_tokens, list)
+                or not positive(max_new_tokens)
+                or any(type(token) is not int or not 0 <= token <= 0x7fffffff
+                       for tokens in (prompt, stop_tokens) for token in tokens)):
+            raise ValueError("explicit bounded token input required")
+        key = sha256(json.dumps((prompt, max_new_tokens, stop_tokens),
+                                separators=(",", ":")).encode()).hexdigest()
+
+        def check_owned():
+            with self._mutex:
+                self._owned(client, grant)
+                entry = self._leases.get(grant.request_id)
+                if (entry is None or entry["terminal"] or self._now() >= entry["receipt"].expires_at
+                        or turn_id not in self._turns or self._return or self._audit_fault):
+                    raise Hold("native generation turn is no longer live")
+                self.arbiter.require_running(grant)
+
+        check_owned()
+        loader, execution_id = self.facade.model_loader(grant)
+        if not loader.supports_generation:
+            raise Hold("native model port does not support in-process generation")
+        with self._mutex:
+            check_owned()
+            current = self._generation
+            if current is not None:
+                if (current.grant, current.turn_id, current.input_sha256) != (grant, turn_id, key):
+                    raise Hold("another native generation is still bound to its turn")
+                return current.readback()
+            generation = self._generation = _Generation(grant, turn_id, key)
+
+        try:
+            tokens = loader.generate(grant, execution_id, tuple(prompt), max_new_tokens, tuple(stop_tokens),
+                                     check_owned)
+            with self._mutex:
+                check_owned()
+                generation.tokens = tokens
+                generation.state = "COMPLETE"
+                return generation.readback()
+        finally:
+            with self._mutex:
+                if generation.state == "RUNNING":
+                    generation.state = "FAILED"
+                if turn_id not in self._turns:
+                    self._generation = None
+
     def end_turn(self, client_id, token, grant: Grant, turn_id: str):
         client = self._authenticate(client_id, token)
         identity(turn_id)
@@ -385,6 +449,9 @@ class HostController(ClientLeaseLifecycle):
                         turn_id=turn_id, had_started=was_running)
             self._turns.discard(turn_id)
             self._ended_turns.add(turn_id)
+            current = self._generation
+            if current is not None and current.turn_id == turn_id and current.state != "RUNNING":
+                self._generation = None
             if was_running:
                 self._activity = now
 
@@ -501,7 +568,7 @@ class HostController(ClientLeaseLifecycle):
                     if not state["return_requested"]:
                         self._audit("return-requested", reason=self._return[0], grant=asdict(self._active))
                         self.arbiter.request_return(self._active)
-                    if self._turns:
+                    if self._turns or self._generation is not None:
                         return self._snapshot()
                     grant = self._active
                     requeue = self._return[1]
@@ -556,7 +623,7 @@ class HostController(ClientLeaseLifecycle):
         try:
             with self._mutex:
                 self._owned(client, grant)
-                if self._turns:
+                if self._turns or self._generation is not None:
                     raise Hold("interactive turn still in flight")
                 if self._return is not None and self._return[1] is not False:
                     raise Hold("existing handoff must retain its original requeue decision")

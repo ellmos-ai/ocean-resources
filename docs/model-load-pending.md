@@ -222,6 +222,14 @@ out. A retry on the same exact grant and turn reports `LOADING`, `READY` or
 The normal completion operation must still verify the native proof before
 inference. Host polling remains available during materialization.
 
+After `begin_turn`, `generate_model(grant, turn_id, prompt, max_new_tokens)`
+executes a bounded token request on the native port. Repeating the exact input
+for that live turn reads `RUNNING`, `COMPLETE` or `FAILED` without launching
+another decode. Ending the turn discards its result and revokes further
+generation. The controller retains the resource grant while any admitted
+native computation is still unwinding. This endpoint uses token IDs and
+does not handle text rendering, tokenization or tool calls.
+
 
 
 For a verified wired load, the native port implements `unload_wired(spec,
