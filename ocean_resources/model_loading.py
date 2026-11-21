@@ -9,7 +9,9 @@ alone do not implement that contract and must leave ``credit`` absent.
 from array import array
 from copy import deepcopy
 import ctypes as C
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from functools import wraps
 import hashlib
 import json
 import os
@@ -712,6 +714,24 @@ class WiredWeightRegion:
     gpu_verified: bool = False
 
 
+@contextmanager
+def _metal_autorelease_pool(runtime):
+    pool = runtime.objc.objc_autoreleasePoolPush()
+    try:
+        yield
+    finally:
+        if pool:
+            runtime.objc.objc_autoreleasePoolPop(pool)
+
+
+def _with_metal_autorelease_pool(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with _metal_autorelease_pool(self._rt):
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class DarwinWiredWeightRunner:
     """Cooperative Apple Silicon weight runner backing ResidentCredit v2.
 
@@ -726,30 +746,24 @@ class DarwinWiredWeightRunner:
         if not positive(max_total_bytes):
             raise ValueError("positive max_total_bytes required")
         self._rt = _get_metal_runtime()
-        self._max_total_bytes = max_total_bytes
-        self._total_mapped_bytes = 0
-        self._pool = self._rt.objc.objc_autoreleasePoolPush()
-        self._device = self._rt.metal.MTLCreateSystemDefaultDevice()
-        if not self._device or not self._rt.send(C.c_bool, self._device, "hasUnifiedMemory"):
-            self._pop_pool_only()
-            raise Hold("unified_metal_device_required")
-        self._max_buffer_len = self._rt.send(C.c_ulong, self._device, "maxBufferLength")
-        self._refs: list[int] = []
-        self._pipeline: int | None = None
-        self._queue: int | None = None
-        self._regions: dict[str, WiredWeightRegion] = {}
-        self._views: dict[str, str] = {}
-        self._generation = 0
-        self._wire_completed_ns: int | None = None
-        self._bound_scope: WiredScope | None = None
-        self._active_epoch: WiredEpoch | None = None
-        self._retired = False
-        self._gpu_commit_uncertain = False
-
-    def _pop_pool_only(self):
-        if self._pool:
-            self._rt.objc.objc_autoreleasePoolPop(self._pool)
-            self._pool = None
+        with _metal_autorelease_pool(self._rt):
+            self._max_total_bytes = max_total_bytes
+            self._total_mapped_bytes = 0
+            self._device = self._rt.metal.MTLCreateSystemDefaultDevice()
+            if not self._device or not self._rt.send(C.c_bool, self._device, "hasUnifiedMemory"):
+                raise Hold("unified_metal_device_required")
+            self._max_buffer_len = self._rt.send(C.c_ulong, self._device, "maxBufferLength")
+            self._refs: list[int] = []
+            self._pipeline: int | None = None
+            self._queue: int | None = None
+            self._regions: dict[str, WiredWeightRegion] = {}
+            self._views: dict[str, str] = {}
+            self._generation = 0
+            self._wire_completed_ns: int | None = None
+            self._bound_scope: WiredScope | None = None
+            self._active_epoch: WiredEpoch | None = None
+            self._retired = False
+            self._gpu_commit_uncertain = False
 
     def _ensure_compute_pipeline(self):
         if self._pipeline is not None and self._queue is not None:
@@ -803,6 +817,7 @@ class DarwinWiredWeightRunner:
     def regions(self) -> dict[str, WiredWeightRegion]:
         return dict(self._regions)
 
+    @_with_metal_autorelease_pool
     def load_safetensors(
         self,
         path: Path,
@@ -913,6 +928,7 @@ class DarwinWiredWeightRunner:
             raise Hold("duplicate_view_name")
         self._views[view_name] = base_tensor_name
 
+    @_with_metal_autorelease_pool
     def verify_gpu_weight_read(self, tensor_name: str, *, timeout: float = 15.0) -> dict:
         """Execute a Metal compute pass reading every 32-bit word and page boundary of a wired tensor."""
         if self._retired:
@@ -1046,6 +1062,7 @@ class DarwinWiredWeightRunner:
         self._active_epoch = epoch
         return epoch
 
+    @_with_metal_autorelease_pool
     def _release_native_resources(self) -> dict:
         if self._gpu_commit_uncertain:
             raise Hold("gpu_terminal_unconfirmed_no_manual_unmap")
@@ -1054,7 +1071,6 @@ class DarwinWiredWeightRunner:
         self._refs.clear()
         self._pipeline = None
         self._queue = None
-        self._pop_pool_only()
         if self._device:
             self._rt.send(None, self._device, "release")
             self._device = None
