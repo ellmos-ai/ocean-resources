@@ -230,6 +230,16 @@ generation. The controller retains the resource grant while any admitted
 native computation is still unwinding. This endpoint uses token IDs and
 does not handle text rendering, tokenization or tool calls.
 
+A private `ConfiguredHost` configuration can select `kind: "model-mlx"`
+with `socket_id`, the exact `model` specification, `load_policy_sha256`,
+`model_store` and `headroom_bytes`. Ocean publishes `backend: "mlx-qwen"`
+for that model and enables the signed native capacity sampler. The socket
+requires a separately reviewed `ocean-mlx-model-measurement.v1` record
+with `scope: "in-process-mlx"`, `method: "mlx-wired-native-rss-and-cpu-v1"`
+and `runtime_versions` containing the exact MLX and MLX-LM versions.
+An Ollama profile has a different workload fingerprint. Stage the first
+load before opening ordinary inference turns on the resident model.
+
 
 
 For a verified wired load, the native port implements `unload_wired(spec,

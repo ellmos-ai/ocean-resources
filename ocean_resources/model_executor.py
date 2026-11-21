@@ -37,6 +37,25 @@ class ModelSpec:
         return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+class MLXModelSpec(ModelSpec):
+    """Distinct workload identity for the pinned in-process Qwen runtime."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        from .mlx_qwen import QWEN_MANIFEST_SHA256, QWEN_MODEL
+
+        if (self.model, self.digest) != (QWEN_MODEL, QWEN_MANIFEST_SHA256):
+            raise ValueError("exact reviewed MLX Qwen manifest is required")
+
+    def fingerprint(self):
+        from .mlx_qwen import MLX_LM_VERSION
+        from .mlx_weights import MLX_VERSION
+
+        content = {"schema": "ocean-mlx-text-workload.v1",
+                   "runtime_versions": {"mlx": MLX_VERSION, "mlx-lm": MLX_LM_VERSION}, **asdict(self)}
+        return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class ModelAPIExecutor:
     """Owns only the exact configured model grant; host port owns native locking."""
     def __init__(self, arbiter, spec: ModelSpec, port, state_directory: Path, *, load_policy_sha256=None):
@@ -51,6 +70,10 @@ class ModelAPIExecutor:
         self._pid = os.getpid()
         self._execution = None
         self._absence_verified = False
+
+    @property
+    def requires_staged_load(self):
+        return isinstance(self.spec, MLXModelSpec)
 
     def adapter(self):
         return ComputeExecutorAdapter(self.start, self.checkpoint, self.stop, self.readback,
@@ -68,6 +91,8 @@ class ModelAPIExecutor:
             raise Hold("previous model execution remains unresolved")
         identity(execution_id)
         self.arbiter.require_workload(grant, self.spec.fingerprint(), kind="model-api")
+        if self.requires_staged_load and self.arbiter.load_state(grant) is None:
+            raise Hold("cold in-process MLX requires staged load admission")
         self.port.verify_available(self.spec)
         self._execution = (grant, execution_id)
         self._absence_verified = False

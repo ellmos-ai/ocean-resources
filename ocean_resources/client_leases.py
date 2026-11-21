@@ -35,7 +35,7 @@ class ClientLeaseLifecycle:
                 raise Hold("request identity exists or lease history requires explicit archival")
             receipt = RequestLease(self._authority_id, request.request_id, 1, now + ttl)
             self._audit("client-lease-submitted", client_id=client_id, lease=asdict(receipt))
-            self._submit(client, request)
+            self._submit(client, request, model_load=_model_load)
             self._leases[request.request_id] = {
                 "request": request, "initial_ttl": ttl, "receipt": receipt,
                 "terminal": None, "renewals": {}, "model_load": _model_load,

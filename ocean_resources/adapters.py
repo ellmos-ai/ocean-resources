@@ -115,7 +115,12 @@ class BACHFacade:
     def start_next(self, *, model_load_request_id=None, expected_request_id=None) -> Grant:
         with self._mutex:
             if model_load_request_id is None:
-                grant = self.arbiter.acquire(expected_request_id=expected_request_id)
+                selected = self.arbiter.next_request()
+                adapter = self.adapters.get(selected.socket_id)
+                if getattr(getattr(adapter, "model_loader", None), "requires_staged_load", False):
+                    raise Hold("cold in-process MLX requires staged load admission")
+                grant = self.arbiter.acquire(expected_request_id=selected.request_id if expected_request_id is None
+                                             else expected_request_id)
             else:
                 selected = self.arbiter.next_request()
                 adapter = self.adapters.get(selected.socket_id)

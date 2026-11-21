@@ -1,4 +1,4 @@
-"""Validation of independently reviewed Ollama API residency evidence."""
+"""Validation of independently reviewed native model residency evidence."""
 import math
 
 from .contracts import identity, instant, positive, sha256_hex
@@ -9,23 +9,43 @@ def validate_model_profile(profile, evidence, *, host, system, architecture, now
               "model_digest", "model_spec", "peak_resident_bytes", "sample_count", "sample_interval_seconds",
               "started_at", "finished_at", "unload_ack_verified", "model_absence_verified",
               "server_version", "unmeasured_external_residency", "peak_cpu_units", "cpu_concurrency_units"}
-    version2 = evidence.get("schema") == "ocean-model-measurement.v2"
-    if version2:
+    schema = evidence.get("schema")
+    mlx = schema == "ocean-mlx-model-measurement.v1"
+    native_peak = mlx or schema == "ocean-model-measurement.v2"
+    if native_peak:
         fields |= {"peak_process_rss_bytes", "process_identity_verified", "measured_processes"}
+    if mlx:
+        fields.remove("server_version")
+        fields.add("runtime_versions")
     if set(evidence) != fields:
         raise ValueError("exact reviewed model measurement fields required")
+    if mlx:
+        from .mlx_qwen import MLX_LM_VERSION
+        from .mlx_weights import MLX_VERSION
+
+        valid_measurement = (
+            system == "Darwin" and architecture == "arm64"
+            and evidence["scope"] == "in-process-mlx"
+            and evidence["method"] == "mlx-wired-native-rss-and-cpu-v1"
+            and evidence["runtime_versions"] == {"mlx": MLX_VERSION, "mlx-lm": MLX_LM_VERSION}
+        )
+    else:
+        valid_measurement = (
+            schema in {"ocean-model-measurement.v1", "ocean-model-measurement.v2"}
+            and evidence["scope"] == "ollama-model-api" and evidence["server_version"] == "0.33.3"
+            and evidence["method"] == ("ollama-ps-native-rss-and-cpu-v2" if native_peak
+                                       else "ollama-ps-and-native-cpu-v1")
+        )
     if (profile["schema"] != "ocean-reviewed-workload-profile.v1" or profile["kind"] != "model-api"
-            or evidence["schema"] not in {"ocean-model-measurement.v1", "ocean-model-measurement.v2"}
-            or evidence["scope"] != "ollama-model-api" or evidence["method"] != (
-                "ollama-ps-native-rss-and-cpu-v2" if version2 else "ollama-ps-and-native-cpu-v1")
+            or not valid_measurement
             or evidence["unload_ack_verified"] is not True or evidence["model_absence_verified"] is not True
-            or evidence["unmeasured_external_residency"] is not False or evidence["server_version"] != "0.33.3"):
+            or evidence["unmeasured_external_residency"] is not False):
         raise ValueError("unsupported or incomplete model measurement scope")
-    if version2 and (not positive(evidence["peak_process_rss_bytes"])
+    if native_peak and (not positive(evidence["peak_process_rss_bytes"])
             or evidence["process_identity_verified"] is not True
             or profile["ram_bytes"] < evidence["peak_process_rss_bytes"] + profile["ram_margin_bytes"]):
-        raise ValueError("v2 model profile lacks native process evidence and full peak margin")
-    if version2:
+        raise ValueError("model profile lacks native process evidence and full peak margin")
+    if native_peak:
         from .model_loading import ProcessIdentity
         processes = evidence["measured_processes"]
         if not isinstance(processes, list) or not 1 <= len(processes) <= 128:
@@ -39,8 +59,8 @@ def validate_model_profile(profile, evidence, *, host, system, architecture, now
     for key in ("workload_sha256", "evidence_sha256"):
         sha256_hex(profile[key])
     sha256_hex(evidence["model_digest"])
-    from .model_executor import ModelSpec
-    spec = ModelSpec(**evidence["model_spec"])
+    from .model_executor import MLXModelSpec, ModelSpec
+    spec = (MLXModelSpec if mlx else ModelSpec)(**evidence["model_spec"])
     if spec.fingerprint() != profile["workload_sha256"] or spec.digest != evidence["model_digest"]:
         raise ValueError("model evidence does not match the reviewed target and context")
     if any(profile[k] != v for k, v in (("host_id", host), ("platform", system), ("architecture", architecture))):

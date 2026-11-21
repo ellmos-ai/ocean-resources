@@ -101,8 +101,11 @@ class InProcessQwenPort:
             if self._runner is not None and not self._runner.retired:
                 raise Hold("previous in-process Qwen load remains unresolved")
             check_owned()
+            weights = self._plan.wired_bytes + self._plan.subpage_bytes
+            if weights > permit["profile_ram_bytes"]:
+                raise Hold("Qwen weights exceed the live load permit")
             cap = self._capacity(capacity_reader)
-            minimum = self._plan.wired_bytes + self._plan.subpage_bytes + cap.reserve_ram_bytes + self._headroom
+            minimum = weights + cap.reserve_ram_bytes + self._headroom
             if (cap.reading.host_id != host_id or cap.pressure_level != 1
                     or cap.physical_available_ram_bytes < minimum):
                 raise Hold("insufficient signed headroom for the in-process Qwen model")

@@ -196,13 +196,16 @@ class HostController(ClientLeaseLifecycle):
             raise Hold("this client requires an explicit bounded request lease")
         return self._submit(client, request)
 
-    def _submit(self, client, request):
+    def _submit(self, client, request, *, model_load=False):
         with self._mutex:
             if self._audit_fault:
                 raise Hold("controller audit unavailable")
             if (not isinstance(request, SlotRequest) or request.socket_id not in client.sockets
                 or request.priority < client.priority_floor or request.interactive and not client.allow_interactive):
                 raise Hold("request exceeds configured client scope")
+            adapter = self.facade.adapters.get(request.socket_id)
+            if not model_load and getattr(getattr(adapter, "model_loader", None), "requires_staged_load", False):
+                raise Hold("cold in-process MLX requires staged load admission")
             old = self._owners.get(request.request_id)
             if old is not None and old != client.client_id:
                 raise Hold("request belongs to another native client")
