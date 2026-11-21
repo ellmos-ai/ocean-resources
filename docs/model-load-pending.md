@@ -163,6 +163,31 @@ after the last native reference has gone away. Authorized teardown closes
 borrowing and waits for outstanding leases before releasing any Metal or VM
 resource. The caller retries teardown after the leases drain.
 
+On Apple Silicon, the optional `ocean_resources.mlx_weights.MLXWeightBindings`
+adapter obtains and retains each Ocean lease while MLX holds its shared
+buffer. Compile the extension with the same Python environment used by the
+model runner. The pinned MLX and nanobind versions share the native array ABI.
+
+```sh
+python -m pip install mlx==0.32.0 nanobind==2.13.0
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+cmake -S native/mlx -B build/mlx -DCMAKE_BUILD_TYPE=Release \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -Dnanobind_DIR="$(python -m nanobind --cmake_dir)" \
+  -DCMAKE_CXX_COMPILER="$DEVELOPER_DIR/usr/bin/clang++" \
+  -DCMAKE_OSX_SYSROOT="$DEVELOPER_DIR/SDKs/MacOSX.sdk"
+cmake --build build/mlx
+PYTHONPATH="$PWD/build/mlx${PYTHONPATH:+:$PYTHONPATH}" python -c 'import mlx.core; import _ocean_mlx_wired'
+```
+
+Call `array(name, shape, dtype)` after the runner has loaded the named
+tensor. Stop admitting requests and dispose of model and cache arrays before
+calling `drain()`. It synchronizes MLX and returns leases with confirmed native
+release. Retry after outstanding references end. An ambiguous native bind
+remains held until the runner process exits or positive cleanup is established.
+The build and runtime are opt-in. Existing non-MLX port configurations use
+their existing dependencies.
+
 For a verified wired load, the native port implements `unload_wired(spec,
 retire_epoch)`. It passes the exact admitted epoch to the callback after the
 controller has requested return and recorded the execution checkpoint. The
