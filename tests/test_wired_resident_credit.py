@@ -953,11 +953,22 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
             def verify_available(self, actual):
                 assert actual == spec
 
-            def unload(self, actual, owned):
-                owned()
+            def unload_wired(self, actual, retire_epoch):
+                assert actual == spec
+                epoch = live_scope_box["epoch"]
+                with pytest.raises(Hold, match="no exact wired epoch"):
+                    retire_epoch(replace(epoch, generation=epoch.generation + 1))
+                receipt = retire_epoch(epoch)
+                assert writer.unresolved()["load_state"]["retirement"] == asdict(receipt)
+                if "cleanup" not in live_scope_box:
+                    live_scope_box["cleanup"] = runner.retire_and_unwire(receipt)
+                assert writer.unresolved()["load_state"]["retirement"] == asdict(receipt)
 
             def resident_bytes(self, actual):
-                return expected_credit
+                assert actual == spec
+                if runner.retired and live_scope_box.pop("hold_readback_once", False):
+                    raise Hold("fixture_zero_residency_readback_unavailable")
+                return 0 if runner.retired else expected_credit
 
             def load_observation(self, actual, policy_sha256, *, loaded, expected_process=None, capacity_reader=None, accept=None):
                 if not loaded:
@@ -975,6 +986,7 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 cap = capacity_reader()
                 after_epoch = runner.export_epoch(scope)
                 pre_commit_epoch = runner.export_epoch(scope)
+                live_scope_box["epoch"] = pre_commit_epoch
                 credit = build_wired_resident_credit(
                     scope=scope,
                     before_sample_epoch=before_epoch,
@@ -1046,14 +1058,25 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
             retirement = DurableRetirement("RETIRED", live_scope, runner.generation)
             lease = runner.borrow_weight("block0.mlp.weight")
             try:
-                with pytest.raises(Hold, match="wired_weight_leases_still_active"):
-                    runner.retire_and_unwire(retirement)
+                held = ctl.finish(client.client_id, client.token, grant)
+                assert held["state"] == "HOLD" and held["error"] == "wired_weight_leases_still_active"
+                assert held["torch"] == asdict(grant)
+                assert writer.unresolved()["load_state"]["retirement"] == asdict(retirement)
                 assert C.c_uint32.from_address(lease.address).value == 0x11223344
             finally:
                 runner.release_weight(lease)
 
-            # Durable RETIRED readback and drained borrowers allow native cleanup.
-            audit = runner.retire_and_unwire(retirement)
+            live_scope_box["hold_readback_once"] = True
+            awaiting_readback = ctl.finish(client.client_id, client.token, grant)
+            assert awaiting_readback["state"] == "HOLD"
+            assert awaiting_readback["error"] == "fixture_zero_residency_readback_unavailable"
+            assert awaiting_readback["torch"] == asdict(grant)
+            assert writer.unresolved()["load_state"]["retirement"] == asdict(retirement)
+
+            released = ctl.finish(client.client_id, client.token, grant)
+            assert released["state"] == "IDLE" and released["torch"] is None
+            assert writer.unresolved() is None
+            audit = live_scope_box["cleanup"]
             assert audit["cleanup_verified"] is True
             assert audit["regions_released"] == 2
             assert runner.retired is True

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .adapters import ComputeExecutorAdapter
 from .contracts import Checkpoint, ExitReadback, Hold, identity, sha256_hex
+from .model_loading import verified_wired_epoch
 
 
 @dataclass(frozen=True)
@@ -174,6 +175,16 @@ class ModelAPIExecutor:
         state = self.arbiter.load_state(grant)
         if state is not None and state["phase"] == "PREPARED":
             self.abort_load(grant, execution_id, "cancelled-before-begin")
+        elif verified_wired_epoch(state) is not None:
+            unload = getattr(self.port, "unload_wired", None)
+            if not callable(unload):
+                raise Hold("native port cannot unload an admitted wired epoch")
+
+            def retire_epoch(epoch):
+                self._owned(grant, execution_id, phase="checkpointed")
+                return self.arbiter.retire_wired_epoch(grant, execution_id, epoch)
+
+            unload(self.spec, retire_epoch)
         else:
             self.port.unload(self.spec, lambda: self._owned(grant, execution_id, phase="checkpointed"))
 

@@ -15,7 +15,7 @@ from threading import RLock
 from copy import deepcopy
 from typing import Callable
 
-from .model_loading import ModelLoadLifecycle
+from .model_loading import DurableRetirement, ModelLoadLifecycle, WiredEpoch, verified_wired_epoch
 from .authority import HostWriterAuthority
 from .profiles import ReviewedProfileGate
 from .contracts import (
@@ -559,12 +559,44 @@ class HostLocalArbiter(ModelLoadLifecycle):
         return self._checkpoints.get(request_id)
 
     @serialized
+    def retire_wired_epoch(self, grant: Grant, execution_id: str, epoch: WiredEpoch) -> DurableRetirement:
+        """Durably fence the admitted backing before the executor unwires it."""
+        active = self._current(grant)
+        state = self._load_state(grant)
+        admitted = verified_wired_epoch(state)
+        evidence = active.execution_evidence
+        if (not active.return_requested or evidence is None or not isinstance(epoch, WiredEpoch)
+                or admitted != json.loads(json.dumps(asdict(epoch)))):
+            raise Hold("no exact wired epoch eligible for retirement")
+        self.require_model_evidence(grant, execution_id, evidence["workload_sha256"],
+                                    evidence["model"], evidence["digest"], phase="checkpointed")
+        retirement = DurableRetirement("RETIRED", epoch.scope, epoch.generation)
+        receipt = asdict(retirement)
+        if "retirement" in state:
+            if state["retirement"] != receipt:
+                raise Hold("durable wired retirement identity changed")
+            return retirement
+        active.load_state["retirement"] = receipt
+        try:
+            self.authority.record(asdict(active))
+            self._load_state(grant)
+        except BaseException:
+            active.load_state.pop("retirement")
+            raise
+        return retirement
+
+    @serialized
     def release(self, grant: Grant, checkpoint: Checkpoint, exit_readback: ExitReadback, *, requeue: bool = True):
         active = self._current(grant)
         if type(requeue) is not bool:
             raise Hold("requeue must be boolean")
         if active.load_state and active.load_state["phase"] in {"MAY_LOAD", "RECOVERY_HOLD"}:
             raise Hold("possible late model load requires explicit native reconciliation")
+        epoch = verified_wired_epoch(active.load_state)
+        if epoch is not None:
+            expected = {"phase": "RETIRED", "scope": epoch["scope"], "generation": epoch["generation"]}
+            if self._load_state(grant).get("retirement") != expected:
+                raise Hold("exact durable wired retirement is required before grant release")
         if not isinstance(checkpoint, Checkpoint) or not checkpoint.valid_for(grant):
             raise Hold("checkpoint identity or integrity failed")
         now = self._now()

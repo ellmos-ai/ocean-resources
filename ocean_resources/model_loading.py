@@ -182,6 +182,16 @@ def permit_unwire(epoch: WiredEpoch, readback: DurableRetirement | None) -> None
         raise Hold("retirement has no exact durable readback")
 
 
+def verified_wired_epoch(load_state):
+    """Return the exact journaled epoch from a completed wired admission."""
+    if load_state is None or load_state["phase"] != "VERIFIED":
+        return None
+    credit = load_state["completion"]["observation"]["credit"]
+    if credit is None or credit["source"] != WIRED_CREDIT_SOURCE:
+        return None
+    return credit["wired_proof"]["pre_commit_epoch"]
+
+
 @dataclass(frozen=True)
 class ModelLoadCapacity:
     reading: CapacityReadback

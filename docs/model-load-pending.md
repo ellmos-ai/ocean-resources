@@ -163,6 +163,15 @@ after the last native reference has gone away. Authorized teardown closes
 borrowing and waits for outstanding leases before releasing any Metal or VM
 resource. The caller retries teardown after the leases drain.
 
+For a verified wired load, the native port implements `unload_wired(spec,
+retire_epoch)`. It passes the exact admitted epoch to the callback after the
+controller has requested return and recorded the execution checkpoint. The
+callback persists and reads back the epoch retirement before the port unwires.
+The controller keeps the resource grant until the native port separately
+reports zero residency and the arbiter accepts a subsequent capacity sample.
+The port must make unload retries idempotent, including retries after native
+cleanup when the controller could not yet verify the final release.
+
 Stock Ollama 0.33.3 does not export this cooperative wire/generation proof and
 remains at `supports_load_pending = False` with `0` bytes credited.
 
