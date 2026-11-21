@@ -205,6 +205,17 @@ to MLX. `load` and `generate` require a caller-owned grant check. Each
 limit. The native port owns admission, capacity, durable retirement and
 final unmapping. Drain the runtime before releasing the runner's mappings.
 
+The opt-in `InProcessQwenPort` owns that runtime. An in-process consumer
+submits and begins the existing staged load, then passes the durable
+`MAY_LOAD` permit to `materialize`. The native port independently verifies
+the same permit throughout loading and checks signed RAM headroom before the
+first allocation. Call the controller's normal load completion before
+starting an inference turn. Completion registers and verifies the wired epoch.
+For ordinary return and for abort, the port drains MLX, waits for durable
+retirement when required, and separately reports absence. This port requires
+the `native` dependency group and the optional MLX extension.
+
+
 
 For a verified wired load, the native port implements `unload_wired(spec,
 retire_epoch)`. It passes the exact admitted epoch to the callback after the
