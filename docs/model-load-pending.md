@@ -188,6 +188,14 @@ remains held until the runner process exits or positive cleanup is established.
 The build and runtime are opt-in. Existing non-MLX port configurations use
 their existing dependencies.
 
+For the pinned `qwen3.8:27b-mlx` checkpoint, `build_qwen_text_plan`
+validates the manifest, configuration, tensor headers and NVFP4 scale layout
+against MLX-LM 0.31.3. Its result describes every text parameter and reports
+page-rounded wired bytes and subpage bytes before starting any weight load.
+The runtime must combine these sizes with the current capacity, context and
+working-memory budget. The text plan omits Vision and speculative MTP
+parameters.
+
 For a verified wired load, the native port implements `unload_wired(spec,
 retire_epoch)`. It passes the exact admitted epoch to the callback after the
 controller has requested return and recorded the execution checkpoint. The
