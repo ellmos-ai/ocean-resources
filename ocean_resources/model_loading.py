@@ -764,6 +764,12 @@ class DarwinWiredWeightRunner:
             self._active_epoch: WiredEpoch | None = None
             self._retired = False
             self._gpu_commit_uncertain = False
+            self._teardown_started = False
+            self._metal_deallocated_ns: dict[str, int] = {}
+            self._munlocked_regions: set[str] = set()
+            self._unmapped_regions: set[str] = set()
+            self._munlock_started_ns: int | None = None
+            self._wire_ended_ns: int | None = None
 
     def _ensure_compute_pipeline(self):
         if self._pipeline is not None and self._queue is not None:
@@ -828,6 +834,8 @@ class DarwinWiredWeightRunner:
         """Load selected .safetensors tensors into mlock'd anonymous Metal bytesNoCopy buffers."""
         if self._retired:
             raise Hold("runner_already_retired")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if self._active_epoch is not None:
             raise Hold("cannot_mutate_weights_after_epoch_exported")
         path = Path(path)
@@ -922,6 +930,8 @@ class DarwinWiredWeightRunner:
         """Register an aliased view sharing the exact physical allocation_id of base_tensor_name."""
         if self._retired or self._active_epoch is not None:
             raise Hold("cannot_register_view_after_epoch_exported")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if base_tensor_name not in self._regions:
             raise Hold("base_tensor_not_loaded")
         if view_name in self._regions or view_name in self._views:
@@ -933,6 +943,8 @@ class DarwinWiredWeightRunner:
         """Execute a Metal compute pass reading every 32-bit word and page boundary of a wired tensor."""
         if self._retired:
             raise Hold("runner_already_retired")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if tensor_name not in self._regions:
             raise Hold("wired_tensor_not_found")
         region = self._regions[tensor_name]
@@ -1028,6 +1040,8 @@ class DarwinWiredWeightRunner:
         """Export the immutable WiredEpoch bound to scope once all tensors are GPU-verified."""
         if self._retired:
             raise Hold("runner_already_retired")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if not isinstance(scope, WiredScope):
             raise Hold("wired_scope_required")
         if not self._regions or self._wire_completed_ns is None or self._generation <= 0:
@@ -1062,45 +1076,59 @@ class DarwinWiredWeightRunner:
         self._active_epoch = epoch
         return epoch
 
-    @_with_metal_autorelease_pool
     def _release_native_resources(self) -> dict:
         if self._gpu_commit_uncertain:
             raise Hold("gpu_terminal_unconfirmed_no_manual_unmap")
-        for ref in reversed(self._refs):
-            self._rt.send(None, ref, "release")
-        self._refs.clear()
-        self._pipeline = None
-        self._queue = None
-        if self._device:
-            self._rt.send(None, self._device, "release")
-            self._device = None
+        self._teardown_started = True
+        with _metal_autorelease_pool(self._rt):
+            while self._refs:
+                self._rt.send(None, self._refs[-1], "release")
+                self._refs.pop()
+            self._pipeline = None
+            self._queue = None
+            if self._device:
+                self._rt.send(None, self._device, "release")
+                self._device = None
 
-        dealloc_times: list[int] = []
-        for region in self._regions.values():
+        for name, region in self._regions.items():
+            if name in self._metal_deallocated_ns:
+                continue
             with _METAL_DEALLOC_LOCK:
-                events = _METAL_DEALLOC_EVENTS.pop((region.address, region.mapped_bytes), [])
+                key = (region.address, region.mapped_bytes)
+                events = _METAL_DEALLOC_EVENTS.get(key, [])
+                if len(events) == 1:
+                    _METAL_DEALLOC_EVENTS.pop(key, None)
             if len(events) != 1:
-                raise Hold("metal_deallocator_unconfirmed:" + region.tensor_name)
-            dealloc_times.append(events[0])
+                raise Hold("metal_deallocator_unconfirmed:" + name)
+            self._metal_deallocated_ns[name] = events[0]
 
-        munlock_started_ns = time.monotonic_ns()
-        for region in self._regions.values():
+        if self._munlock_started_ns is None:
+            self._munlock_started_ns = time.monotonic_ns()
+        for name, region in self._regions.items():
+            if name in self._munlocked_regions or name in self._unmapped_regions:
+                continue
             if self._rt.libc.munlock(region.address, region.mapped_bytes) != 0:
-                raise Hold("munlock_failed:" + region.tensor_name)
-        wire_ended_ns = time.monotonic_ns()
-        for region in self._regions.values():
+                raise Hold("munlock_failed:" + name)
+            self._munlocked_regions.add(name)
+        if self._wire_ended_ns is None:
+            self._wire_ended_ns = time.monotonic_ns()
+        for name, region in self._regions.items():
+            if name in self._unmapped_regions:
+                continue
             if self._rt.libc.munmap(region.address, region.mapped_bytes) != 0:
-                raise Hold("munmap_failed:" + region.tensor_name)
+                raise Hold("munmap_failed:" + name)
+            self._unmapped_regions.add(name)
 
         self._retired = True
         self._total_mapped_bytes = 0
+        dealloc_times = list(self._metal_deallocated_ns.values())
         return {
             "regions_released": len(self._regions),
             "wire_completed_ns": self._wire_completed_ns,
             "metal_deallocated_min_ns": min(dealloc_times) if dealloc_times else None,
             "metal_deallocated_max_ns": max(dealloc_times) if dealloc_times else None,
-            "munlock_started_ns": munlock_started_ns,
-            "wire_ended_ns": wire_ended_ns,
+            "munlock_started_ns": self._munlock_started_ns,
+            "wire_ended_ns": self._wire_ended_ns,
             "cleanup_verified": True,
         }
 
@@ -1121,9 +1149,11 @@ class DarwinWiredWeightRunner:
         return audit
 
     def emergency_teardown(self) -> dict:
-        """Cleanup for aborted pre-credit setup or test teardown; permanently retires runner."""
+        """Clean up aborted pre-credit setup; never bypass a published epoch."""
         if self._retired:
             return {"regions_released": 0, "cleanup_verified": True, "already_retired": True}
+        if self._active_epoch is not None:
+            raise Hold("emergency_teardown_after_epoch_export_requires_durable_retirement")
         audit = self._release_native_resources()
         audit["emergency_teardown"] = True
         return audit
