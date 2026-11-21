@@ -196,6 +196,16 @@ The runtime must combine these sizes with the current capacity, context and
 working-memory budget. The text plan omits Vision and speculative MTP
 parameters.
 
+`QwenTextRuntime` executes that plan in process. Before binding a wired
+tensor it verifies its file against the content-addressed blob name and
+checks that the copied tensor bytes match the digest obtained in that same
+verification pass. It then verifies Metal access and transfers a weight lease
+to MLX. `load` and `generate` require a caller-owned grant check. Each
+`generate` call uses an independent cache within the configured context
+limit. The native port owns admission, capacity, durable retirement and
+final unmapping. Drain the runtime before releasing the runner's mappings.
+
+
 For a verified wired load, the native port implements `unload_wired(spec,
 retire_epoch)`. It passes the exact admitted epoch to the callback after the
 controller has requested return and recorded the execution checkpoint. The
