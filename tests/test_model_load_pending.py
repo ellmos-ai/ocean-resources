@@ -273,15 +273,40 @@ def test_native_proof_ack_loss_retries_do_not_load_or_promote_twice(pending_host
     assert writer.unresolved() == saved and port.calls == []
 
 
-def test_successful_abort_uses_strict_port_then_native_release(pending_host):
+def test_successful_abort_uses_strict_port_then_native_release(pending_host, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+
     ctl, client, operator, arbiter, port, _free, _now, writer, _sensor = pending_host
-    _lease, state = start(pending_host)
+    lease, state = start(pending_host)
     grant = Grant(**state["torch"])
     ctl.begin_model_load(client.client_id, client.token, grant, "attempt")
     port.resident = 19 * GIB
     assert ctl.complete_model_load(client.client_id, client.token, grant, "attempt", False)["state"] == "RETURN_REQUESTED"
     assert port.calls == ["guarded-unload"] and writer.unresolved() is not None
-    assert ctl.tick(operator.client_id, operator.token)["state"] == "IDLE"
+    released, acknowledge = Event(), Event()
+    yield_active = ctl.facade.yield_active
+
+    def pause_after_release(grant, *, requeue):
+        checkpoint = yield_active(grant, requeue=requeue)
+        released.set()
+        assert acknowledge.wait(5)
+        return checkpoint
+
+    monkeypatch.setattr(ctl.facade, "yield_active", pause_after_release)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        tick = pool.submit(ctl.tick, operator.client_id, operator.token)
+        try:
+            assert released.wait(5)
+            handoff = ctl.request_status(client.client_id, client.token, lease.request_id)
+            assert handoff["state"] == "RETURN_REQUESTED"
+            assert handoff["grant"] == asdict(grant) and handoff["model_load"] is None
+        finally:
+            acknowledge.set()
+        assert tick.result(timeout=5)["state"] == "IDLE"
+
+    finished = ctl.request_status(client.client_id, client.token, lease.request_id)
+    assert finished["state"] == "FINISHED" and finished["grant"] is None
     assert arbiter.status()["torch"] is None and writer.unresolved() is None
 
 
