@@ -43,6 +43,7 @@ from ocean_resources import (
 )
 from ocean_resources.capacity import CapacityPolicy, NativeCapacitySensor
 from ocean_resources.host import HostObservation
+from ocean_resources import model_loading
 from ocean_resources.model_executor import ModelAPIExecutor, ModelSpec
 from ocean_resources.model_loading import (
     LoadObservation,
@@ -739,6 +740,46 @@ def test_parse_safetensors_header_valid_and_rejections(tmp_path):
 
 
 # --- 4. Live Apple Silicon macOS end-to-end Metal + .safetensors + /usr/bin/vm_stat + Arbiter test ---
+
+@pytest.mark.parametrize("failing_call", ["munlock", "munmap"])
+def test_wired_teardown_resumes_after_partial_failure(monkeypatch, failing_call):
+    calls = []
+    page = 16384
+
+    def cleanup(operation, address, length):
+        calls.append((operation, address))
+        assert length == page
+        return int(operation == failing_call and address == 2 * page
+                   and calls.count((operation, address)) == 1)
+
+    runtime = SimpleNamespace(
+        objc=SimpleNamespace(objc_autoreleasePoolPush=lambda: 1,
+                             objc_autoreleasePoolPop=lambda token: None),
+        metal=SimpleNamespace(MTLCreateSystemDefaultDevice=lambda: 1),
+        libc=SimpleNamespace(munlock=lambda *args: cleanup("munlock", *args),
+                             munmap=lambda *args: cleanup("munmap", *args)),
+        send=lambda *_: 1,
+    )
+    monkeypatch.setattr(model_loading, "_get_metal_runtime", lambda: runtime)
+    events = {}
+    monkeypatch.setattr(model_loading, "_METAL_DEALLOC_EVENTS", events)
+    runner = DarwinWiredWeightRunner()
+    for name, address in (("first", page), ("second", 2 * page)):
+        runner._regions[name] = model_loading.WiredWeightRegion(
+            name, name, address, page, page, 1, page, "a" * 64, address
+        )
+        events[address, page] = [1]
+
+    with pytest.raises(Hold, match=f"{failing_call}_failed:second"):
+        runner.emergency_teardown()
+    assert runner.retired is False
+
+    assert runner.emergency_teardown()["cleanup_verified"] is True
+    assert runner.retired is True
+    assert calls.count(("munlock", page)) == calls.count(("munmap", page)) == 1
+    for operation in ("munlock", "munmap"):
+        assert calls.count((operation, 2 * page)) == (2 if operation == failing_call else 1)
+
 
 @pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
