@@ -609,19 +609,19 @@ class _DarwinMetalRuntime:
         "kernel void wired_verify_u32(\n"
         "    device const uint* w [[buffer(0)]],\n"
         "    device uint* out [[buffer(1)]],\n"
-        "    device const uint* meta [[buffer(2)]],\n"
+        "    device const ulong* meta [[buffer(2)]],\n"
         "    uint tid [[thread_position_in_grid]]) {\n"
-        "    uint count = meta[0];\n"
-        "    uint words_per_page = meta[1];\n"
-        "    uint pages = meta[2];\n"
+        "    ulong count = meta[0];\n"
+        "    ulong words_per_page = meta[1];\n"
+        "    ulong pages = meta[2];\n"
         "    uint s = 0u;\n"
-        "    for (uint i = tid; i < count; i += 256u) {\n"
+        "    for (ulong i = ulong(tid); i < count; i += 256ul) {\n"
         "        s += w[i];\n"
         "    }\n"
         "    uint pm = 0u;\n"
-        "    for (uint p = tid; p < pages; p += 256u) {\n"
+        "    for (ulong p = ulong(tid); p < pages; p += 256ul) {\n"
         "        uint first = w[p * words_per_page];\n"
-        "        uint last = w[(p + 1u) * words_per_page - 1u];\n"
+        "        uint last = w[(p + 1ul) * words_per_page - 1ul];\n"
         "        pm ^= ((first ^ last) + (p * 2654435761u));\n"
         "    }\n"
         "    out[tid * 2u] = s;\n"
@@ -969,14 +969,14 @@ class DarwinWiredWeightRunner:
         out_buf = self._rt.send(C.c_void_p, self._device, "newBufferWithLength:options:",
                                 (C.c_ulong, C.c_ulong), (256 * 2 * 4, 0))
         meta_buf = self._rt.send(C.c_void_p, self._device, "newBufferWithLength:options:",
-                                 (C.c_ulong, C.c_ulong), (12, 0))
+                                 (C.c_ulong, C.c_ulong), (24, 0))
         if not out_buf or not meta_buf:
             if out_buf:
                 self._rt.send(None, out_buf, "release")
             if meta_buf:
                 self._rt.send(None, meta_buf, "release")
             raise Hold("metal_scratch_buffer_allocation_failed")
-        meta_arr = (C.c_uint32 * 3).from_address(self._rt.send(C.c_void_p, meta_buf, "contents"))
+        meta_arr = (C.c_uint64 * 3).from_address(self._rt.send(C.c_void_p, meta_buf, "contents"))
         meta_arr[0] = word_count
         meta_arr[1] = words_per_page
         meta_arr[2] = whole_pages
