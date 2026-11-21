@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import platform
 import time
 from dataclasses import asdict
@@ -18,6 +19,14 @@ from ocean_resources.model_executor import ModelSpec
 from ocean_resources.profiles import native_architecture
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows private-file admission contract")
+def test_windows_private_configuration_fails_closed(tmp_path):
+    path = tmp_path / "host.json"
+    path.write_text("{}", encoding="utf-8")
+    with pytest.raises(Hold, match="native private-file ACL verification"):
+        private_bytes(path)
+
+
 def private(path, value):
     path.write_text(json.dumps(value) if not isinstance(value, str) else value)
     path.chmod(0o600)
@@ -26,6 +35,8 @@ def private(path, value):
 
 @pytest.fixture
 def configured(tmp_path, monkeypatch):
+    if os.name == "nt":
+        pytest.skip("Configured host requires native private-file ACL verification")
     root = tmp_path.resolve()
     root.chmod(0o700)
     now = time.time()
