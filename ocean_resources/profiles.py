@@ -2,8 +2,8 @@
 
 The configured file pins are the approval boundary, not a JSON boolean. Sampled
 resource observations are evidence for a reviewed allocation, not a kernel limit
-or a proof of worst-case RSS/CPU. This first native scope is CPU-owned processes;
-model/GPU/external-daemon residency needs a different independently proved scope.
+or a proof of worst-case RSS/CPU. CPU-owned processes and exact Ollama model API
+targets use different measurement scopes; neither admits arbitrary GPU daemons.
 """
 from __future__ import annotations
 
@@ -118,6 +118,11 @@ class ReviewedProfileGate:
                             "workload_sha256", "ram_bytes", "cpu_units", "ram_margin_bytes", "evidence_sha256",
                             "approved_by", "approved_at", "expires_at"}:
             raise ValueError("exact reviewed workload profile fields required")
+        if profile["kind"] == "model-api":
+            from .model_profiles import validate_model_profile
+            evidence = _document(source.evidence_path, profile["evidence_sha256"], 4 * 1024 * 1024)
+            return validate_model_profile(profile, evidence, host=self._host, system=self._platform,
+                architecture=self._architecture, now=self._clock(), max_age=self._max_age)
         if profile["schema"] != "ocean-reviewed-workload-profile.v1" or profile["kind"] != "cpu-owned-process":
             raise ValueError("unsupported workload profile scope")
         for key in ("profile_id", "socket_id", "host_id", "approved_by"):
@@ -179,6 +184,18 @@ class ReviewedProfileGate:
             return profile
         except Exception as exc:
             raise Hold("reviewed workload profile is unavailable, changed, expired or mismatched") from exc
+
+    def require_model_load(self, socket: ResourceSocket) -> dict:
+        profile = self.require(socket)
+        source = self._sources[socket.profile_id]
+        evidence = _document(source.evidence_path, profile["evidence_sha256"], 4 * 1024 * 1024)
+        if (profile["kind"] != "model-api" or evidence.get("schema") != "ocean-model-measurement.v2"
+                or evidence.get("process_identity_verified") is not True):
+            raise Hold("LOAD_PENDING requires reviewed model API and native process peak evidence")
+        return {"profile": profile, "profile_sha256": source.profile_sha256,
+                "readback": {"profile_path": str(source.profile_path),
+                             "evidence_path": str(source.evidence_path),
+                             "max_age_seconds": self._max_age}}
 
     def inspect(self) -> dict:
         """Read-only validation for configured pins; never acquires a grant."""

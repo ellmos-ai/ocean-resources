@@ -26,6 +26,7 @@ class ComputeExecutorAdapter:
     readback: Callable[[Grant, str], ExitReadback]
     workload_sha256: str | None = None
     execution_kind: str | None = None
+    model_loader: object | None = None
 
 
 @dataclass(frozen=True)
@@ -51,8 +52,9 @@ class ModelSocketBinding:
 
 class ModelSocketInferenceAdapter:
     """Wraps the existing async gate.turn contract, without renaming it."""
-    def __init__(self, arbiter: HostLocalArbiter, binding: ModelSocketBinding, gate):
+    def __init__(self, arbiter: HostLocalArbiter, binding: ModelSocketBinding, gate, *, workload_sha256=None):
         self._arbiter, self.binding, self._gate = arbiter, binding, gate
+        self._workload_sha256 = workload_sha256
 
     @asynccontextmanager
     async def turn(self, grant: Grant, chat_id: str):
@@ -60,7 +62,7 @@ class ModelSocketInferenceAdapter:
         if grant.socket_id != self.binding.socket_id:
             raise Hold("model binding belongs to another resource socket")
         # A CPU process measurement cannot authorize an external model daemon.
-        self._arbiter.require_workload(grant, None, kind="model-api")
+        self._arbiter.require_workload(grant, self._workload_sha256, kind="model-api")
         self._arbiter.require_running(grant)
         async with self._gate.turn(
             chat_id,
@@ -110,9 +112,20 @@ class BACHFacade:
             priority=priority, pointer=pointer,
         )
 
-    def start_next(self) -> Grant:
+    def start_next(self, *, model_load_request_id=None, expected_request_id=None) -> Grant:
         with self._mutex:
-            grant = self.arbiter.acquire()
+            if model_load_request_id is None:
+                grant = self.arbiter.acquire(expected_request_id=expected_request_id)
+            else:
+                selected = self.arbiter.next_request()
+                adapter = self.adapters.get(selected.socket_id)
+                if (selected.request_id != model_load_request_id
+                        or expected_request_id is not None and selected.request_id != expected_request_id
+                        or adapter is None
+                        or adapter.execution_kind != "model-api" or adapter.model_loader is None):
+                    raise Hold("selected request has no native model-load adapter")
+                spec, policy, observation = adapter.model_loader.prepare_load()
+                grant = self.arbiter.acquire_model_load(model_load_request_id, spec, policy, observation)
             adapter = self.adapters.get(grant.socket_id)
             if not isinstance(adapter, ComputeExecutorAdapter):
                 raise Hold("missing executor adapter; reservation remains held")
@@ -130,6 +143,14 @@ class BACHFacade:
             if result is not True:
                 raise Hold("executor start is unverified; reservation remains held")
             return grant
+
+    def model_loader(self, grant):
+        with self._mutex:
+            self.arbiter.request_for(grant)
+            adapter, execution_id = self._executions.get(grant, (None, None))
+            if adapter is None or adapter.execution_kind != "model-api" or adapter.model_loader is None:
+                raise Hold("no owned native model load execution")
+            return adapter.model_loader, execution_id
 
     def yield_active(self, grant: Grant, *, requeue: bool = True) -> Checkpoint:
         with self._mutex:

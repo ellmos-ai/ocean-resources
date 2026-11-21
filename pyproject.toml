@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=77.0.3"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -40,6 +40,11 @@ dev = [
     "ruff>=0.4",
 ]
 
+native = ["psutil>=5.9.6,<8"]
+
+[project.scripts]
+ocean-resource-client = "ocean_resources.client_cli:main"
+
 [project.urls]
 Homepage = "https://github.com/ellmos-ai/ocean-resources#readme"
 Documentation = "https://github.com/ellmos-ai/ocean-resources#readme"
@@ -57,7 +62,7 @@ where = ["."]
 include = ["ocean_resources*"]
 
 [tool.setuptools.package-data]
-ocean_resources = ["manifest.json", "pipeline-catalog.json"]
+ocean_resources = ["*.json"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

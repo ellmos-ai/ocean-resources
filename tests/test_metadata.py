@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
 from importlib.resources import files
 import json
 from pathlib import Path
@@ -42,8 +43,8 @@ def test_version_freeze_and_pep639():
 
     package_data = data.get("tool", {}).get("setuptools", {}).get("package-data", {})
     pkg_files = package_data.get("ocean_resources", [])
-    assert "manifest.json" in pkg_files, "manifest.json must be declared in package-data"
-    assert "pipeline-catalog.json" in pkg_files, "pipeline-catalog.json must be declared in package-data"
+    for name in ("manifest.json", "pipeline-catalog.json"):
+        assert any(fnmatchcase(name, pattern) for pattern in pkg_files), f"{name} must be covered by package-data"
 
     pytest_cfg = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
     assert pytest_cfg.get("xfail_strict") is True, "pytest xfail_strict must be enabled"
