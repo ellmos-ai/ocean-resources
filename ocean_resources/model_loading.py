@@ -871,13 +871,16 @@ class DarwinWiredWeightRunner:
                     if self._rt.libc.minherit(addr, mapped_len, 2) != 0:
                         raise Hold("mapping_inheritance_unconfirmed")
                     stream.seek(data_offset + info.data_start)
-                    raw = stream.read(nbytes)
-                    if len(raw) != nbytes:
-                        raise Hold("safetensors_tensor_read_truncated")
-                    C.memmove(addr, raw, nbytes)
+                    target = memoryview((C.c_ubyte * nbytes).from_address(addr)).cast("B")
+                    offset = 0
+                    while offset < nbytes:
+                        received = stream.readinto(target[offset:offset + 8 * 1024 * 1024])
+                        if not received:
+                            raise Hold("safetensors_tensor_read_truncated")
+                        offset += received
                     if mapped_len > nbytes:
                         C.memset(addr + nbytes, 0, mapped_len - nbytes)
-                    digest = hashlib.sha256(C.string_at(addr, nbytes)).hexdigest()
+                    digest = hashlib.sha256(target).hexdigest()
                     if self._rt.libc.mlock(addr, mapped_len) != 0:
                         raise Hold("mlock_failed_errno:" + str(C.get_errno()))
                     locked = True
