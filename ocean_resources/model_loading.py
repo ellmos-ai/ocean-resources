@@ -6,7 +6,6 @@ residency credit must describe attributable, private, non-reclaimable host RAM
 in the same capacity observation. API size, total RSS and GPU/Metal allocation
 alone do not implement that contract and must leave ``credit`` absent.
 """
-from array import array
 from copy import deepcopy
 import ctypes as C
 from contextlib import contextmanager
@@ -956,9 +955,10 @@ class DarwinWiredWeightRunner:
         whole_pages = region.whole_weight_pages
 
         # Compute exact CPU reference from the wired anonymous buffer.
-        raw_view = C.string_at(region.address, region.raw_bytes)
-        words = array("I")
-        words.frombytes(raw_view)
+        # The mapping stays wired throughout verification. Read it in place so
+        # large tensors do not require two more full-size host allocations.
+        raw_view = memoryview((C.c_ubyte * region.raw_bytes).from_address(region.address)).cast("B")
+        words = raw_view.cast("I")
         expected_sum = sum(words) & 0xFFFFFFFF
         expected_page_mix = 0
         for p in range(whole_pages):
@@ -1015,7 +1015,7 @@ class DarwinWiredWeightRunner:
             gpu_page_mix = 0
             for i in range(256):
                 gpu_page_mix ^= int(out_arr[i * 2 + 1])
-            after_sha = hashlib.sha256(C.string_at(region.address, region.raw_bytes)).hexdigest()
+            after_sha = hashlib.sha256(raw_view).hexdigest()
             if gpu_sum != expected_sum or gpu_page_mix != expected_page_mix or after_sha != region.weights_sha256:
                 raise Hold("gpu_weight_verification_mismatch")
             region.gpu_verified = True
