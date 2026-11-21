@@ -814,7 +814,8 @@ def test_wired_teardown_resumes_after_partial_failure(monkeypatch, failing_call)
     sys.platform != "darwin" or platform.machine() != "arm64",
     reason="Requires Apple Silicon macOS Metal runtime and signed /usr/bin/vm_stat",
 )
-def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_path):
+@pytest.mark.parametrize("reject_proof", [False, True], ids=["verified", "abort-after-registration"])
+def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_path, reject_proof):
     """End-to-end physical #4218 test on live Apple Silicon hardware.
 
     Loads a multi-tensor >4 MiB .safetensors file into mlock'd anonymous pages,
@@ -995,8 +996,18 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                     if accept is not None:
                         accept(obs)
                     return obs
+                raise AssertionError("live wired completion must register the epoch first")
+
+            def load_wired_observation(self, actual, policy_sha256, *, expected_process, capacity_reader,
+                                       accept, register_epoch):
+                assert actual == spec and expected_process == asdict(live_proc)
                 scope = live_scope_box["scope"]
                 before_epoch = runner.export_epoch(scope)
+                live_scope_box["epoch"] = before_epoch
+                register_epoch(before_epoch)
+                assert "registered_wired_epoch" in writer.unresolved()["load_state"]
+                if reject_proof:
+                    raise Hold("fixture_signed_sample_unavailable")
                 cap = capacity_reader()
                 after_epoch = runner.export_epoch(scope)
                 pre_commit_epoch = runner.export_epoch(scope)
@@ -1019,10 +1030,9 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                     accept(obs)
                 return obs
 
-            def abort_load(self, actual, expected_process, owned, *, accept=None):
-                owned()
-                if accept is not None:
-                    accept()
+            def abort_wired_load(self, actual, expected_process, retire_epoch):
+                assert expected_process == asdict(live_proc)
+                self.unload_wired(actual, retire_epoch)
 
         state_dir = tmp_path / "live-state"
         state_dir.mkdir()
@@ -1058,7 +1068,41 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 turn_id="turn-live",
             )
             live_scope_box["scope"] = live_scope
-            completed = ctl.complete_model_load(client.client_id, client.token, grant, "turn-live", True)
+            def complete(successful):
+                return ctl.complete_model_load(client.client_id, client.token, grant, "turn-live", successful)
+
+            retirement = DurableRetirement("RETIRED", live_scope, runner.generation)
+            if reject_proof:
+                with pytest.raises(Hold, match="independent native reconciliation") as fault:
+                    complete(True)
+                assert str(fault.value.__cause__) == "fixture_signed_sample_unavailable"
+                pending = writer.unresolved()["load_state"]
+                assert pending["phase"] == "RECOVERY_HOLD" and pending["completion"] is None
+                assert pending["registered_wired_epoch"]["scope"] == asdict(live_scope)
+                lease = runner.borrow_weight("block0.mlp.weight")
+                try:
+                    with pytest.raises(Hold, match="independent native reconciliation") as fault:
+                        complete(False)
+                    assert str(fault.value.__cause__) == "wired_weight_leases_still_active"
+                    held = writer.unresolved()["load_state"]
+                    assert held["phase"] == "RECOVERY_HOLD"
+                    assert held["retirement"] == asdict(retirement)
+                    assert C.c_uint32.from_address(lease.address).value == 0x11223344
+                finally:
+                    runner.release_weight(lease)
+                live_scope_box["hold_readback_once"] = True
+                with pytest.raises(Hold, match="independent native reconciliation") as fault:
+                    complete(False)
+                assert str(fault.value.__cause__) == "fixture_zero_residency_readback_unavailable"
+                assert writer.unresolved()["load_state"]["phase"] == "RECOVERY_HOLD"
+                assert runner.retired and live_scope_box["cleanup"]["cleanup_verified"]
+                assert complete(False)["state"] == "RETURN_REQUESTED"
+                assert writer.unresolved()["load_state"]["phase"] == "ABORTED"
+                assert ctl.finish(client.client_id, client.token, grant)["state"] == "IDLE"
+                assert writer.unresolved() is None
+                return
+
+            completed = complete(True)
             assert completed["state"] == "RUNNING"
             saved = writer.unresolved()
             assert saved["load_state"]["completion"]["credited_bytes"] == expected_credit
@@ -1069,7 +1113,6 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 runner.retire_and_unwire(DurableRetirement("RECOVERY_HOLD", live_scope, runner.generation))
             assert runner.retired is False
 
-            retirement = DurableRetirement("RETIRED", live_scope, runner.generation)
             lease = runner.borrow_weight("block0.mlp.weight")
             try:
                 held = ctl.finish(client.client_id, client.token, grant)

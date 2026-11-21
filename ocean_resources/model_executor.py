@@ -76,13 +76,16 @@ class ModelAPIExecutor:
         # The normal host inference path performs and supervises any cold load.
         return True
 
-    def _observe_load(self, *, loaded, expected_process=None, accept=None):
+    def _observe_load(self, *, loaded, expected_process=None, accept=None, register_epoch=None):
         if self.load_policy_sha256 is None:
             raise Hold("model cold loading is not configured")
         try:
-            return self.port.load_observation(self.spec, self.load_policy_sha256,
-                loaded=loaded, expected_process=expected_process,
-                capacity_reader=self.arbiter.observe_model_capacity, accept=accept)
+            options = {"expected_process": expected_process,
+                       "capacity_reader": self.arbiter.observe_model_capacity, "accept": accept}
+            observe_wired = getattr(self.port, "load_wired_observation", None) if loaded else None
+            if callable(observe_wired):
+                return observe_wired(self.spec, self.load_policy_sha256, register_epoch=register_epoch, **options)
+            return self.port.load_observation(self.spec, self.load_policy_sha256, loaded=loaded, **options)
         except Hold:
             raise
         except Exception as exc:
@@ -111,7 +114,12 @@ class ModelAPIExecutor:
                 raise Hold("native load proof cannot be committed twice")
             self.arbiter.complete_model_load(grant, self.spec, turn_id, observation)
             committed = True
-        self._observe_load(loaded=True, expected_process=state["baseline"]["process"], accept=accept)
+        def register_epoch(epoch):
+            self._owned(grant, execution_id)
+            self.arbiter.register_wired_epoch(grant, execution_id, turn_id, epoch)
+
+        self._observe_load(loaded=True, expected_process=state["baseline"]["process"],
+                           accept=accept, register_epoch=register_epoch)
         if not committed:
             raise Hold("native inference owner did not commit the model proof")
 
@@ -132,6 +140,20 @@ class ModelAPIExecutor:
                 accept()
             self._observe_load(loaded=False, expected_process=state["baseline"]["process"],
                                accept=accept_absence)
+        elif state.get("registered_wired_epoch") is not None:
+            abort_wired = getattr(self.port, "abort_wired_load", None)
+            if not callable(abort_wired):
+                raise Hold("native port cannot abort a registered wired epoch")
+
+            def retire_epoch(epoch):
+                self._owned(grant, execution_id)
+                return self.arbiter.retire_wired_epoch(grant, execution_id, epoch, abort_turn=turn_id)
+
+            abort_wired(self.spec, state["baseline"]["process"], retire_epoch)
+            resident = self.port.resident_bytes(self.spec)
+            if type(resident) is not int or resident != 0:
+                raise Hold("wired abort has no zero residency readback")
+            accept()
         else:
             # Strict host gate + exact process + terminal ACK/absence, never the
             # legacy warmup helper. An unknown dispatch keeps this call held.
@@ -175,6 +197,9 @@ class ModelAPIExecutor:
         state = self.arbiter.load_state(grant)
         if state is not None and state["phase"] == "PREPARED":
             self.abort_load(grant, execution_id, "cancelled-before-begin")
+        elif state is not None and state["phase"] == "ABORTED" and state.get("registered_wired_epoch"):
+            # The strict abort already unwired; readback still rechecks absence.
+            return
         elif verified_wired_epoch(state) is not None:
             unload = getattr(self.port, "unload_wired", None)
             if not callable(unload):

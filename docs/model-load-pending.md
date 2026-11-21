@@ -171,6 +171,13 @@ The loaded model's journal records the admitted epoch scope, generation,
 backing count and SHA-256 commitment after validating all three epoch samples.
 This keeps the writer record bounded for checkpoints with many weight buffers.
 The exact epoch must still match that commitment before retirement.
+
+A cooperative port's `load_wired_observation` calls `register_epoch` with the
+exact pending load's wired epoch before taking the signed capacity sample.
+If that sample or admission fails, `abort_wired_load` obtains retirement for
+the registered epoch and performs native cleanup under the same process fence.
+The controller keeps the grant in recovery until it receives zero residency.
+A temporary cleanup or readback failure can retry the same durable retirement.
 The controller keeps the resource grant until the native port separately
 reports zero residency and the arbiter accepts a subsequent capacity sample.
 The port must make unload retries idempotent, including retries after native

@@ -474,14 +474,20 @@ class ModelLoadLifecycle:
         if (cap.reading.available_ram_bytes < remaining
                 or observation.available_ram_bytes < cap.reserve_ram_bytes + observation.normal_headroom_bytes):
             raise Hold("loaded model lacks normal reserve and provable remaining peak capacity")
+        registered = state.get("registered_wired_epoch")
         if observation.credit is not None and observation.credit.source == WIRED_CREDIT_SOURCE:
             epoch = observation.credit.wired_proof.pre_commit_epoch
+            commitment = wired_epoch_commitment(epoch)
+            if registered is not None and registered != commitment:
+                raise Hold("verified wired epoch differs from registered backing")
             recorded = asdict(replace(observation, credit=replace(observation.credit, wired_proof=None)))
             recorded["credit"]["wired_proof"] = {
                 "schema": "ocean-wired-epoch-commitment.v1",
-                "epoch": wired_epoch_commitment(epoch),
+                "epoch": commitment,
             }
         else:
+            if registered is not None:
+                raise Hold("registered wired epoch requires a wired residency proof")
             recorded = asdict(observation)
         # A native read can block; repeat immutable approval and expiry checks.
         if self._load_profile(socket)["profile_sha256"] != state["profile_sha256"]:
