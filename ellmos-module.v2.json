@@ -6,7 +6,7 @@
   "category": "control",
   "kind": "library",
   "status": "active",
-  "visibility": "private",
+  "visibility": "public",
   "description": "Kanonischer RAM-Distributor, Modell-Runtime-Scheduler, Fackel-Arbiter und Watchdog-Hysterese für BACH und Ocean.",
   "entrypoints": {
     "library": "ocean_resources",
