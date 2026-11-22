@@ -156,14 +156,21 @@ def test_gitignore_lock_and_log_defense():
 
 
 def test_llm_installation_guidance_present():
+    import re
+
     en_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
     de_readme = (REPO_ROOT / "README_de.md").read_text(encoding="utf-8")
     llms_txt = (REPO_ROOT / "llms.txt").read_text(encoding="utf-8")
 
+    assert "### Install with your LLM" in en_readme
+    assert "Install and verify https://github.com/ellmos-ai/ocean-resources" in en_readme
+    assert "### Mit deinem LLM installieren" in de_readme
+
     for doc_name, content in (("README.md", en_readme), ("README_de.md", de_readme)):
         assert "llms.txt" in content and "SKILL.md" in content, f"{doc_name} must reference llms.txt and SKILL.md"
-        assert "curl" not in content or "| sh" not in content, f"{doc_name} must not recommend curl|sh"
-        assert "Install with your LLM" in content or "Mit deinem LLM installieren" in content
+        assert not re.search(r"\bcurl\s+[^\n`]+\|\s*(?:sh|bash)\b", content, re.IGNORECASE), (
+            f"{doc_name} must not recommend curl|sh"
+        )
 
     for section in ("Prerequisites", "Install", "Verification", "python -m pytest"):
         assert section in llms_txt, f"llms.txt missing machine-readable guidance: {section}"

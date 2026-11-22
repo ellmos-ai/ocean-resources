@@ -259,13 +259,13 @@ python -m compileall -q ocean_resources tests
 python -m ocean_resources manifest
 ```
 
-### Install with your LLM / Mit deinem LLM installieren
+### Install with your LLM
 
 ```text
-Installiere und verifiziere https://github.com/ellmos-ai/ocean-resources (Release-Tag/Commit-Pin bevorzugen, keine ungeprüften curl|sh-Pipes):
-1. Lies zuerst llms.txt und SKILL.md im Repo-Root.
-2. Erstelle eine isolierte Umgebung (.venv) und führe den Installationsbefehl aus llms.txt aus.
-3. Prüfe die Installation mit dem Verifikationsbefehl (python -m pytest && python -m ocean_resources manifest) und berichte das Ergebnis.
+Install and verify https://github.com/ellmos-ai/ocean-resources (prefer a release tag or commit pin; never run unreviewed curl|sh pipes):
+1. Read llms.txt and SKILL.md in the repository root first.
+2. Create an isolated virtual environment (.venv) and run the install command from llms.txt.
+3. Verify the installation with the verification command (python -m pytest && python -m ocean_resources manifest) and report the result.
 ```
 
 ---
