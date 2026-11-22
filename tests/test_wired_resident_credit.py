@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
+import ctypes as C
 import hashlib
 import json
 import os
@@ -43,6 +44,7 @@ from ocean_resources import (
 )
 from ocean_resources.capacity import CapacityPolicy, NativeCapacitySensor
 from ocean_resources.host import HostObservation
+from ocean_resources import model_loading
 from ocean_resources.model_executor import ModelAPIExecutor, ModelSpec
 from ocean_resources.model_loading import (
     LoadObservation,
@@ -319,14 +321,18 @@ def _start_and_begin(h, turn_id="turn-1"):
 
 # --- 1. Production ResidentCredit v2 contract tests (full arbiter lifecycle) ---
 
-def test_bound_wired_epoch_credits_unique_pages_and_promotes_to_running(wired_host):
+@pytest.mark.parametrize("backing_count", [2, 946])
+def test_bound_wired_epoch_credits_unique_pages_and_promotes_to_running(wired_host, backing_count):
     grant = _start_and_begin(wired_host)
     wired_host.state["resident"] = 12 * GIB
     wired_host.available_pages[0] = (4 * GIB + 512 * 1024 * 1024) // PAGE
     scope = wired_host.make_scope(grant, "turn-1")
-    backing = wired_host.make_backing()
-    # Two aliased views of the exact same physical allocation count once.
-    epoch = WiredEpoch(scope, 1, 1_500, (backing, backing))
+    unique = backing_count - 1
+    pages, remainder = divmod((12 * GIB) // PAGE, unique)
+    backings = tuple(wired_host.make_backing(pages + int(i < remainder), allocation_id=f"region-{i}")
+                     for i in range(unique))
+    # Aliased views still count only once.
+    epoch = WiredEpoch(scope, 1, 1_500, (*backings, backings[0]))
     wired_host.state["credit_builder"] = lambda cap: build_wired_resident_credit(
         scope=scope,
         before_sample_epoch=epoch,
@@ -341,7 +347,14 @@ def test_bound_wired_epoch_credits_unique_pages_and_promotes_to_running(wired_ho
     assert status["state"] == "RUNNING"
     saved = wired_host.writer.unresolved()
     assert saved["load_state"]["phase"] == "VERIFIED"
-    assert saved["load_state"]["completion"]["credited_bytes"] == 12 * GIB
+    completion = saved["load_state"]["completion"]
+    assert completion["credited_bytes"] == 12 * GIB
+    proof = completion["observation"]["credit"]["wired_proof"]
+    assert proof["schema"] == "ocean-wired-epoch-commitment.v1"
+    assert proof["epoch"]["backing_count"] == backing_count
+    epoch_bytes = json.dumps(asdict(epoch), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    assert proof["epoch"]["sha256"] == hashlib.sha256(epoch_bytes).hexdigest()
+    assert wired_host.writer._path.stat().st_size < 16 * 1024
 
 
 def _expect_complete_hold(wired_host, grant, expected_inner_substring: str, turn_id: str = "turn-1"):
@@ -740,11 +753,69 @@ def test_parse_safetensors_header_valid_and_rejections(tmp_path):
 
 # --- 4. Live Apple Silicon macOS end-to-end Metal + .safetensors + /usr/bin/vm_stat + Arbiter test ---
 
+@pytest.mark.parametrize("failing_call", ["munlock", "munmap"])
+def test_wired_teardown_resumes_after_partial_failure(monkeypatch, failing_call):
+    calls = []
+    page = 16384
+
+    def cleanup(operation, address, length):
+        calls.append((operation, address))
+        assert length == page
+        return int(operation == failing_call and address == 2 * page
+                   and calls.count((operation, address)) == 1)
+
+    runtime = SimpleNamespace(
+        objc=SimpleNamespace(objc_autoreleasePoolPush=lambda: 1,
+                             objc_autoreleasePoolPop=lambda token: None),
+        metal=SimpleNamespace(MTLCreateSystemDefaultDevice=lambda: 1),
+        libc=SimpleNamespace(munlock=lambda *args: cleanup("munlock", *args),
+                             munmap=lambda *args: cleanup("munmap", *args)),
+        send=lambda *_: 1,
+    )
+    monkeypatch.setattr(model_loading, "_get_metal_runtime", lambda: runtime)
+    events = {}
+    monkeypatch.setattr(model_loading, "_METAL_DEALLOC_EVENTS", events)
+    runner = DarwinWiredWeightRunner()
+    for name, address in (("first", page), ("second", 2 * page)):
+        runner._regions[name] = model_loading.WiredWeightRegion(
+            name, name, address, page, page, 1, page, "a" * 64, address
+        )
+        events[address, page] = [1]
+
+    first = runner.borrow_weight("first")
+    duplicate = runner.borrow_weight("first")
+    assert first is not duplicate
+    assert (first.address, first.raw_bytes) == (page, page)
+    with pytest.raises(Hold, match="unowned_or_released"):
+        runner.release_weight(model_loading.WiredWeightLease("first", page, page))
+    runner.release_weight(first)
+    with pytest.raises(Hold, match="unowned_or_released"):
+        runner.release_weight(first)
+    with pytest.raises(Hold, match="wired_weight_leases_still_active"):
+        runner.emergency_teardown()
+    assert not calls
+    assert set(events) == {(page, page), (2 * page, page)}
+    with pytest.raises(Hold, match="unavailable_for_borrow"):
+        runner.borrow_weight("first")
+    runner.release_weight(duplicate)
+
+    with pytest.raises(Hold, match=f"{failing_call}_failed:second"):
+        runner.emergency_teardown()
+    assert runner.retired is False
+
+    assert runner.emergency_teardown()["cleanup_verified"] is True
+    assert runner.retired is True
+    assert calls.count(("munlock", page)) == calls.count(("munmap", page)) == 1
+    for operation in ("munlock", "munmap"):
+        assert calls.count((operation, 2 * page)) == (2 if operation == failing_call else 1)
+
+
 @pytest.mark.skipif(
     sys.platform != "darwin" or platform.machine() != "arm64",
     reason="Requires Apple Silicon macOS Metal runtime and signed /usr/bin/vm_stat",
 )
-def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_path):
+@pytest.mark.parametrize("reject_proof", [False, True], ids=["verified", "abort-after-registration"])
+def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_path, reject_proof):
     """End-to-end physical #4218 test on live Apple Silicon hardware.
 
     Loads a multi-tensor >4 MiB .safetensors file into mlock'd anonymous pages,
@@ -894,11 +965,25 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
             def verify_available(self, actual):
                 assert actual == spec
 
-            def unload(self, actual, owned):
-                owned()
+            def unload_wired(self, actual, retire_epoch):
+                assert actual == spec
+                epoch = live_scope_box["epoch"]
+                with pytest.raises(Hold, match="no exact wired epoch"):
+                    retire_epoch(replace(epoch, generation=epoch.generation + 1))
+                changed_backing = replace(epoch.backings[-1], weights_sha256="0" * 64)
+                with pytest.raises(Hold, match="no exact wired epoch"):
+                    retire_epoch(replace(epoch, backings=(*epoch.backings[:-1], changed_backing)))
+                receipt = retire_epoch(epoch)
+                assert writer.unresolved()["load_state"]["retirement"] == asdict(receipt)
+                if "cleanup" not in live_scope_box:
+                    live_scope_box["cleanup"] = runner.retire_and_unwire(receipt)
+                assert writer.unresolved()["load_state"]["retirement"] == asdict(receipt)
 
             def resident_bytes(self, actual):
-                return expected_credit
+                assert actual == spec
+                if runner.retired and live_scope_box.pop("hold_readback_once", False):
+                    raise Hold("fixture_zero_residency_readback_unavailable")
+                return 0 if runner.retired else expected_credit
 
             def load_observation(self, actual, policy_sha256, *, loaded, expected_process=None, capacity_reader=None, accept=None):
                 if not loaded:
@@ -911,11 +996,22 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                     if accept is not None:
                         accept(obs)
                     return obs
+                raise AssertionError("live wired completion must register the epoch first")
+
+            def load_wired_observation(self, actual, policy_sha256, *, expected_process, capacity_reader,
+                                       accept, register_epoch):
+                assert actual == spec and expected_process == asdict(live_proc)
                 scope = live_scope_box["scope"]
                 before_epoch = runner.export_epoch(scope)
+                live_scope_box["epoch"] = before_epoch
+                register_epoch(before_epoch)
+                assert "registered_wired_epoch" in writer.unresolved()["load_state"]
+                if reject_proof:
+                    raise Hold("fixture_signed_sample_unavailable")
                 cap = capacity_reader()
                 after_epoch = runner.export_epoch(scope)
                 pre_commit_epoch = runner.export_epoch(scope)
+                live_scope_box["epoch"] = pre_commit_epoch
                 credit = build_wired_resident_credit(
                     scope=scope,
                     before_sample_epoch=before_epoch,
@@ -934,10 +1030,9 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                     accept(obs)
                 return obs
 
-            def abort_load(self, actual, expected_process, owned, *, accept=None):
-                owned()
-                if accept is not None:
-                    accept()
+            def abort_wired_load(self, actual, expected_process, retire_epoch):
+                assert expected_process == asdict(live_proc)
+                self.unload_wired(actual, retire_epoch)
 
         state_dir = tmp_path / "live-state"
         state_dir.mkdir()
@@ -973,7 +1068,41 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 turn_id="turn-live",
             )
             live_scope_box["scope"] = live_scope
-            completed = ctl.complete_model_load(client.client_id, client.token, grant, "turn-live", True)
+            def complete(successful):
+                return ctl.complete_model_load(client.client_id, client.token, grant, "turn-live", successful)
+
+            retirement = DurableRetirement("RETIRED", live_scope, runner.generation)
+            if reject_proof:
+                with pytest.raises(Hold, match="independent native reconciliation") as fault:
+                    complete(True)
+                assert str(fault.value.__cause__) == "fixture_signed_sample_unavailable"
+                pending = writer.unresolved()["load_state"]
+                assert pending["phase"] == "RECOVERY_HOLD" and pending["completion"] is None
+                assert pending["registered_wired_epoch"]["scope"] == asdict(live_scope)
+                lease = runner.borrow_weight("block0.mlp.weight")
+                try:
+                    with pytest.raises(Hold, match="independent native reconciliation") as fault:
+                        complete(False)
+                    assert str(fault.value.__cause__) == "wired_weight_leases_still_active"
+                    held = writer.unresolved()["load_state"]
+                    assert held["phase"] == "RECOVERY_HOLD"
+                    assert held["retirement"] == asdict(retirement)
+                    assert C.c_uint32.from_address(lease.address).value == 0x11223344
+                finally:
+                    runner.release_weight(lease)
+                live_scope_box["hold_readback_once"] = True
+                with pytest.raises(Hold, match="independent native reconciliation") as fault:
+                    complete(False)
+                assert str(fault.value.__cause__) == "fixture_zero_residency_readback_unavailable"
+                assert writer.unresolved()["load_state"]["phase"] == "RECOVERY_HOLD"
+                assert runner.retired and live_scope_box["cleanup"]["cleanup_verified"]
+                assert complete(False)["state"] == "RETURN_REQUESTED"
+                assert writer.unresolved()["load_state"]["phase"] == "ABORTED"
+                assert ctl.finish(client.client_id, client.token, grant)["state"] == "IDLE"
+                assert writer.unresolved() is None
+                return
+
+            completed = complete(True)
             assert completed["state"] == "RUNNING"
             saved = writer.unresolved()
             assert saved["load_state"]["completion"]["credited_bytes"] == expected_credit
@@ -984,8 +1113,27 @@ def test_darwin_live_safetensors_wired_metal_vmstat_and_arbiter_lifecycle(tmp_pa
                 runner.retire_and_unwire(DurableRetirement("RECOVERY_HOLD", live_scope, runner.generation))
             assert runner.retired is False
 
-            # Only durable RETIRED readback unlocks Metal deallocation -> munlock -> munmap.
-            audit = runner.retire_and_unwire(DurableRetirement("RETIRED", live_scope, runner.generation))
+            lease = runner.borrow_weight("block0.mlp.weight")
+            try:
+                held = ctl.finish(client.client_id, client.token, grant)
+                assert held["state"] == "HOLD" and held["error"] == "wired_weight_leases_still_active"
+                assert held["torch"] == asdict(grant)
+                assert writer.unresolved()["load_state"]["retirement"] == asdict(retirement)
+                assert C.c_uint32.from_address(lease.address).value == 0x11223344
+            finally:
+                runner.release_weight(lease)
+
+            live_scope_box["hold_readback_once"] = True
+            awaiting_readback = ctl.finish(client.client_id, client.token, grant)
+            assert awaiting_readback["state"] == "HOLD"
+            assert awaiting_readback["error"] == "fixture_zero_residency_readback_unavailable"
+            assert awaiting_readback["torch"] == asdict(grant)
+            assert writer.unresolved()["load_state"]["retirement"] == asdict(retirement)
+
+            released = ctl.finish(client.client_id, client.token, grant)
+            assert released["state"] == "IDLE" and released["torch"] is None
+            assert writer.unresolved() is None
+            audit = live_scope_box["cleanup"]
             assert audit["cleanup_verified"] is True
             assert audit["regions_released"] == 2
             assert runner.retired is True

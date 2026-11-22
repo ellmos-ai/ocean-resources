@@ -91,6 +91,87 @@ def configured(tmp_path, monkeypatch):
             obj.writer.__exit__(None, None, None)
 
 
+@pytest.mark.skipif(platform.system() != "Darwin" or platform.machine() != "arm64",
+                    reason="Apple Silicon MLX host configuration")
+def test_configured_mlx_host_requires_separate_native_profile_and_staged_admission(tmp_path, monkeypatch):
+    from ocean_resources.mlx_qwen import QWEN_MANIFEST_SHA256, QWEN_MODEL, QwenTextPlan
+    from ocean_resources.model_executor import MLXModelSpec
+
+    root = tmp_path.resolve()
+    root.chmod(0o700)
+    spec = MLXModelSpec(QWEN_MODEL, QWEN_MANIFEST_SHA256, 4096)
+    assert spec.fingerprint() != ModelSpec(**asdict(spec)).fingerprint()
+    host = platform.node()
+    common = {"host_id": host, "platform": platform.system(), "architecture": native_architecture(),
+              "workload_sha256": spec.fingerprint()}
+    now = time.time()
+    evidence = {"schema": "ocean-mlx-model-measurement.v1", "scope": "in-process-mlx",
+                "method": "mlx-wired-native-rss-and-cpu-v1", **common,
+                "model_digest": spec.digest, "model_spec": asdict(spec), "peak_resident_bytes": 32_768,
+                "peak_process_rss_bytes": 32_768, "peak_cpu_units": .6, "cpu_concurrency_units": 1,
+                "sample_count": 3, "sample_interval_seconds": 1, "started_at": now - 10,
+                "finished_at": now - 6, "unload_ack_verified": True, "model_absence_verified": True,
+                "runtime_versions": {"mlx": "0.32.0", "mlx-lm": "0.31.3"},
+                "unmeasured_external_residency": False, "process_identity_verified": True,
+                "measured_processes": [{"pid": 1, "created_at": 2.0, "boot_time": 1.0}]}
+    ep = private(root / "mlx-evidence.json", evidence)
+    profile = {"schema": "ocean-reviewed-workload-profile.v1", "kind": "model-api",
+               "profile_id": "mlx", "socket_id": "model", **common, "ram_bytes": 65_536, "cpu_units": 1,
+               "ram_margin_bytes": 32_768, "approved_by": "fixture-reviewer", "approved_at": now - 5,
+               "expires_at": now + 60, "evidence_sha256": hashlib.sha256(ep.read_bytes()).hexdigest()}
+    pp = private(root / "mlx-profile.json", profile)
+    token = private(root / "token", "o" * 32)
+    endpoint = root / "client.json"
+    config = {"schema": "ocean-host-config.v1", "host_id": host, "state_directory": str(root), "port": 0,
+              "capacity": {"reserve_ram_bytes": 2**31, "reserve_cpu_units": 1, "reserve_disk_bytes": 1,
+                           "directory": str(root)},
+              "profiles": [{"profile_path": str(pp), "profile_sha256": hashlib.sha256(pp.read_bytes()).hexdigest(),
+                            "evidence_path": str(ep)}], "profile_max_age_seconds": 60,
+              "sockets": [{"socket_id": "model", "host_id": host, "ram_bytes": 65_536, "cpu_units": 1,
+                           "profile_id": "mlx", "workload_sha256": spec.fingerprint()}],
+              "clients": [{"client_id": "operator", "sockets": ["model"], "token_file": str(token),
+                           "operator": True, "allow_interactive": True, "priority_floor": 1,
+                           "require_leases": True, "allow_model_load": True, "endpoint_file": str(endpoint)}],
+              "executors": [{"socket_id": "model", "kind": "model-mlx", "model": asdict(spec),
+                             "load_policy_sha256": "e" * 64, "model_store": str(root), "headroom_bytes": 2**31}],
+              "focus": {}}
+    cp = private(root / "host.json", config)
+    sensor_options = []
+    def sensor(*args, **kwargs):
+        sensor_options.append(kwargs)
+        return lambda: None
+    def plan(store, *, model, model_digest):
+        assert (store, model, model_digest) == (root, spec.model, spec.digest)
+        return QwenTextPlan(spec.digest, b"{}", {}, (), 32_768, 0)
+    def ollama_factory():
+        raise AssertionError("MLX must select its own native port")
+
+    monkeypatch.setattr("ocean_resources.configuration.NativeCapacitySensor", sensor)
+    monkeypatch.setattr("ocean_resources.mlx_qwen.build_qwen_text_plan", plan)
+    obj = ConfiguredHost(cp, hashlib.sha256(cp.read_bytes()).hexdigest(), model_port_factory=ollama_factory)
+    try:
+        client, models = read_client(endpoint)
+        assert models == [{"socket_id": "model", **asdict(spec), "backend": "mlx-qwen",
+                           "load_policy_sha256": "e" * 64}]
+        assert sensor_options == [{"use_platform_vm_stat": True}]
+        request = SlotRequest("mlx-request", "model", "bach-model", host, "idem", interactive=True)
+        with pytest.raises(Hold, match="requires staged"):
+            obj.controller.submit_leased(client.client_id, client.token, request, 60)
+        assert obj.arbiter.status()["waiting"] == []
+        assert obj.controller.submit_model_load(client.client_id, client.token, request, 60).request_id == request.request_id
+    finally:
+        obj.close()
+
+    evidence["runtime_versions"]["mlx"] = "0.33.0"
+    private(ep, evidence)
+    profile["evidence_sha256"] = hashlib.sha256(ep.read_bytes()).hexdigest()
+    private(pp, profile)
+    config["profiles"][0]["profile_sha256"] = hashlib.sha256(pp.read_bytes()).hexdigest()
+    private(cp, config)
+    with pytest.raises(ValueError, match="measurement scope"):
+        ConfiguredHost(cp, hashlib.sha256(cp.read_bytes()).hexdigest(), model_port_factory=ollama_factory)
+
+
 def test_product_client_turn_has_own_liveness_and_returns_after_idle(configured):
     _obj, root, port, _ = configured
     client, models = read_client(root / "bach.json")

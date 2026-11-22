@@ -15,7 +15,9 @@ from threading import RLock
 from copy import deepcopy
 from typing import Callable
 
-from .model_loading import ModelLoadLifecycle
+from .model_loading import (
+    DurableRetirement, ModelLoadLifecycle, WiredEpoch, verified_wired_epoch, wired_epoch_commitment,
+)
 from .authority import HostWriterAuthority
 from .profiles import ReviewedProfileGate
 from .contracts import (
@@ -247,9 +249,21 @@ class HostLocalArbiter(ModelLoadLifecycle):
         state = active.load_state
         if state is None or state["phase"] == "VERIFIED" or state["turn_id"] not in {None, turn_id}:
             raise Hold("abort does not identify this staged load")
+        epoch = state.get("registered_wired_epoch")
+        if epoch is not None:
+            expected = {"phase": "RETIRED", "scope": epoch["scope"], "generation": epoch["generation"]}
+            if self._load_state(grant).get("retirement") != expected:
+                raise Hold("registered wired epoch requires durable retirement before abort")
+        previous = deepcopy(state)
+        previous_return = active.return_requested
         state.update(phase="ABORTED", turn_id=turn_id)
         active.return_requested = True
-        self.authority.record(asdict(active))
+        try:
+            self.authority.record(asdict(active))
+        except BaseException:
+            active.load_state = previous
+            active.return_requested = previous_return
+            raise
 
     @serialized
     def hold_model_load(self, grant, reason):
@@ -559,12 +573,87 @@ class HostLocalArbiter(ModelLoadLifecycle):
         return self._checkpoints.get(request_id)
 
     @serialized
+    def register_wired_epoch(self, grant: Grant, execution_id: str, turn_id: str, epoch: WiredEpoch):
+        """Record the native backing identity while the exact load permit is live."""
+        active = self._current(grant)
+        state = self._load_state(grant)
+        if (state is None or state["phase"] != "MAY_LOAD" or state["turn_id"] != turn_id
+                or state["execution_id"] != execution_id or active.execution_identity != execution_id
+                or not isinstance(epoch, WiredEpoch)):
+            raise Hold("wired epoch registration requires its exact pending load")
+        scope = epoch.scope
+        spec = state["spec"]
+        if (scope.owner_id != self._authority_id or scope.owner_fence != grant.generation
+                or scope.turn_id != turn_id or scope.model_digest != spec["digest"]
+                or scope.context_tokens != spec["context_tokens"]
+                or scope.workload_sha256 != state["workload_sha256"]
+                or asdict(scope.listener) != state["baseline"]["process"]):
+            raise Hold("wired epoch registration scope differs from load permit")
+        commitment = wired_epoch_commitment(epoch)
+        previous = state.get("registered_wired_epoch")
+        if previous is not None:
+            if previous != commitment:
+                raise Hold("registered wired epoch changed during load")
+            return
+        active.load_state["registered_wired_epoch"] = commitment
+        try:
+            self.authority.record(asdict(active))
+            self._load_state(grant)
+        except BaseException:
+            active.load_state.pop("registered_wired_epoch")
+            raise
+
+    @serialized
+    def retire_wired_epoch(self, grant: Grant, execution_id: str, epoch: WiredEpoch, *,
+                           abort_turn: str | None = None) -> DurableRetirement:
+        """Durably fence the exact backing before the executor unwires it."""
+        active = self._current(grant)
+        state = self._load_state(grant)
+        evidence = active.execution_evidence
+        if abort_turn is None:
+            admitted = verified_wired_epoch(state) if active.return_requested else None
+        else:
+            admitted = (state.get("registered_wired_epoch") if state is not None
+                        and state["phase"] in {"MAY_LOAD", "RECOVERY_HOLD"}
+                        and state["turn_id"] == abort_turn and state["execution_id"] == execution_id else None)
+        if (evidence is None or not isinstance(epoch, WiredEpoch)
+                or admitted != wired_epoch_commitment(epoch)):
+            raise Hold("no exact wired epoch eligible for retirement")
+        self.require_model_evidence(grant, execution_id, evidence["workload_sha256"],
+                                    evidence["model"], evidence["digest"],
+                                    phase="checkpointed" if abort_turn is None else None)
+        retirement = DurableRetirement("RETIRED", epoch.scope, epoch.generation)
+        receipt = asdict(retirement)
+        if "retirement" in state:
+            if state["retirement"] != receipt:
+                raise Hold("durable wired retirement identity changed")
+            return retirement
+        previous_return = active.return_requested
+        active.load_state["retirement"] = receipt
+        if abort_turn is not None:
+            active.load_state.update(phase="RECOVERY_HOLD", reason="wired-abort-awaiting-unload")
+            active.return_requested = True
+        try:
+            self.authority.record(asdict(active))
+            self._load_state(grant)
+        except BaseException:
+            active.load_state = state
+            active.return_requested = previous_return
+            raise
+        return retirement
+
+    @serialized
     def release(self, grant: Grant, checkpoint: Checkpoint, exit_readback: ExitReadback, *, requeue: bool = True):
         active = self._current(grant)
         if type(requeue) is not bool:
             raise Hold("requeue must be boolean")
         if active.load_state and active.load_state["phase"] in {"MAY_LOAD", "RECOVERY_HOLD"}:
             raise Hold("possible late model load requires explicit native reconciliation")
+        epoch = verified_wired_epoch(active.load_state)
+        if epoch is not None:
+            expected = {"phase": "RETIRED", "scope": epoch["scope"], "generation": epoch["generation"]}
+            if self._load_state(grant).get("retirement") != expected:
+                raise Hold("exact durable wired retirement is required before grant release")
         if not isinstance(checkpoint, Checkpoint) or not checkpoint.valid_for(grant):
             raise Hold("checkpoint identity or integrity failed")
         now = self._now()

@@ -157,6 +157,111 @@ For cooperative Apple Silicon runners, `ocean_resources.model_loading` and
    of Metal buffers, `munlock` and `munmap` is refused unless `permit_unwire`
    receives an exact `DurableRetirement("RETIRED", scope, generation)`.
 
+An in-process inference runtime can use `borrow_weight` to hold a backing
+across asynchronous GPU work. It returns the same lease with `release_weight`
+after the last native reference has gone away. Authorized teardown closes
+borrowing and waits for outstanding leases before releasing any Metal or VM
+resource. The caller retries teardown after the leases drain.
+
+On Apple Silicon, the optional `ocean_resources.mlx_weights.MLXWeightBindings`
+adapter obtains and retains each Ocean lease while MLX holds its shared
+buffer. Compile the extension with the same Python environment used by the
+model runner. The pinned MLX and nanobind versions share the native array ABI.
+
+```sh
+python -m pip install mlx==0.32.0 nanobind==2.13.0
+export DEVELOPER_DIR=/Library/Developer/CommandLineTools
+cmake -S native/mlx -B build/mlx -DCMAKE_BUILD_TYPE=Release \
+  -DPython_EXECUTABLE="$(command -v python)" \
+  -Dnanobind_DIR="$(python -m nanobind --cmake_dir)" \
+  -DCMAKE_CXX_COMPILER="$DEVELOPER_DIR/usr/bin/clang++" \
+  -DCMAKE_OSX_SYSROOT="$DEVELOPER_DIR/SDKs/MacOSX.sdk"
+cmake --build build/mlx
+PYTHONPATH="$PWD/build/mlx${PYTHONPATH:+:$PYTHONPATH}" python -c 'import mlx.core; import _ocean_mlx_wired'
+```
+
+Call `array(name, shape, dtype)` after the runner has loaded the named
+tensor. Stop admitting requests and dispose of model and cache arrays before
+calling `drain()`. It synchronizes MLX and returns leases with confirmed native
+release. Retry after outstanding references end. An ambiguous native bind
+remains held until the runner process exits or positive cleanup is established.
+The build and runtime are opt-in. Existing non-MLX port configurations use
+their existing dependencies.
+
+For the pinned `qwen3.8:27b-mlx` checkpoint, `build_qwen_text_plan`
+validates the manifest, configuration, tensor headers and NVFP4 scale layout
+against MLX-LM 0.31.3. Its result describes every text parameter and reports
+page-rounded wired bytes and subpage bytes before starting any weight load.
+The runtime must combine these sizes with the current capacity, context and
+working-memory budget. The text plan omits Vision and speculative MTP
+parameters.
+
+`QwenTextRuntime` executes that plan in process. Before binding a wired
+tensor it verifies its file against the content-addressed blob name and
+checks that the copied tensor bytes match the digest obtained in that same
+verification pass. It then verifies Metal access and transfers a weight lease
+to MLX. `load` and `generate` require a caller-owned grant check. Each
+`generate` call uses an independent cache within the configured context
+limit. The native port owns admission, capacity, durable retirement and
+final unmapping. Drain the runtime before releasing the runner's mappings.
+
+The opt-in `InProcessQwenPort` owns that runtime. An in-process consumer
+submits and begins the existing staged load, then passes the durable
+`MAY_LOAD` permit to `materialize`. The native port independently verifies
+the same permit throughout loading and checks signed RAM headroom before the
+first allocation. Call the controller's normal load completion before
+starting an inference turn. Completion registers and verifies the wired epoch.
+For ordinary return and for abort, the port drains MLX, waits for durable
+retirement when required, and separately reports absence. This port requires
+the `native` dependency group and the optional MLX extension.
+
+A configured loopback client can invoke `materialize_model_load(grant, turn_id)`
+after begin. The host retains the running operation when the connection times
+out. A retry on the same exact grant and turn reports `LOADING`, `READY` or
+`FAILED` without starting a second load. `READY` means the weight load ended.
+The normal completion operation must still verify the native proof before
+inference. Host polling remains available during materialization.
+
+After `begin_turn`, `generate_model(grant, turn_id, prompt, max_new_tokens)`
+executes a bounded token request on the native port. Repeating the exact input
+for that live turn reads `RUNNING`, `COMPLETE` or `FAILED` without launching
+another decode. Ending the turn discards its result and revokes further
+generation. The controller retains the resource grant while any admitted
+native computation is still unwinding. This endpoint uses token IDs and
+does not handle text rendering, tokenization or tool calls.
+
+A private `ConfiguredHost` configuration can select `kind: "model-mlx"`
+with `socket_id`, the exact `model` specification, `load_policy_sha256`,
+`model_store` and `headroom_bytes`. Ocean publishes `backend: "mlx-qwen"`
+for that model and enables the signed native capacity sampler. The socket
+requires a separately reviewed `ocean-mlx-model-measurement.v1` record
+with `scope: "in-process-mlx"`, `method: "mlx-wired-native-rss-and-cpu-v1"`
+and `runtime_versions` containing the exact MLX and MLX-LM versions.
+An Ollama profile has a different workload fingerprint. Stage the first
+load before opening ordinary inference turns on the resident model.
+
+
+
+For a verified wired load, the native port implements `unload_wired(spec,
+retire_epoch)`. It passes the exact admitted epoch to the callback after the
+controller has requested return and recorded the execution checkpoint. The
+callback persists and reads back the epoch retirement before the port unwires.
+The loaded model's journal records the admitted epoch scope, generation,
+backing count and SHA-256 commitment after validating all three epoch samples.
+This keeps the writer record bounded for checkpoints with many weight buffers.
+The exact epoch must still match that commitment before retirement.
+
+A cooperative port's `load_wired_observation` calls `register_epoch` with the
+exact pending load's wired epoch before taking the signed capacity sample.
+If that sample or admission fails, `abort_wired_load` obtains retirement for
+the registered epoch and performs native cleanup under the same process fence.
+The controller keeps the grant in recovery until it receives zero residency.
+A temporary cleanup or readback failure can retry the same durable retirement.
+The controller keeps the resource grant until the native port separately
+reports zero residency and the arbiter accepts a subsequent capacity sample.
+The port must make unload retries idempotent, including retries after native
+cleanup when the controller could not yet verify the final release.
+
 Stock Ollama 0.33.3 does not export this cooperative wire/generation proof and
 remains at `supports_load_pending = False` with `0` bytes credited.
 

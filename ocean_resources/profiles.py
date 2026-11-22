@@ -189,7 +189,8 @@ class ReviewedProfileGate:
         profile = self.require(socket)
         source = self._sources[socket.profile_id]
         evidence = _document(source.evidence_path, profile["evidence_sha256"], 4 * 1024 * 1024)
-        if (profile["kind"] != "model-api" or evidence.get("schema") != "ocean-model-measurement.v2"
+        if (profile["kind"] != "model-api"
+                or evidence.get("schema") not in {"ocean-model-measurement.v2", "ocean-mlx-model-measurement.v1"}
                 or evidence.get("process_identity_verified") is not True):
             raise Hold("LOAD_PENDING requires reviewed model API and native process peak evidence")
         return {"profile": profile, "profile_sha256": source.profile_sha256,
