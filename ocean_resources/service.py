@@ -1,5 +1,5 @@
 """Explicit loopback transport for one existing host controller, never a job queue."""
-from dataclasses import fields
+from dataclasses import asdict, fields
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
@@ -7,12 +7,14 @@ import socket
 from threading import BoundedSemaphore, Event, Lock, Thread, Timer, current_thread
 import time
 
-from .contracts import Grant, Hold, HybridPlannerPointer, SlotRequest, identity, positive
+from .contracts import Grant, Hold, HybridPlannerPointer, RequestLease, SlotRequest, identity, positive
 from .controller import ControllerClient, HostController, OverrideCommand
 
 SCHEMA = "ocean-host-transport.v1"
 LIMIT = 1024 * 1024
-OPERATIONS = frozenset({"status", "submit", "begin_turn", "end_turn", "override", "finish", "tick"})
+OPERATIONS = frozenset({"status", "submit", "submit_leased", "renew", "cancel", "request_status",
+                        "begin_turn", "end_turn", "override", "finish", "tick",
+                        "submit_model_load", "begin_model_load", "complete_model_load"})
 
 
 def decode_json(raw: bytes) -> dict:
@@ -251,13 +253,36 @@ class HostService:
             return state
         if operation == "submit":
             return self.controller.submit(client_id, token, contract(SlotRequest, payload))
+        if operation in {"submit_leased", "submit_model_load"}:
+            exact(payload, ("request", "ttl_seconds"))
+            return asdict(getattr(self.controller, operation)(client_id, token,
+                contract(SlotRequest, payload["request"]), payload["ttl_seconds"]))
+        if operation == "request_status":
+            exact(payload, ("request_id",))
+            return self.controller.request_status(client_id, token, payload["request_id"])
+        if operation == "renew":
+            exact(payload, ("lease", "renewal_id", "ttl_seconds"))
+            return asdict(self.controller.renew(client_id, token,
+                contract(RequestLease, payload["lease"]), payload["renewal_id"], payload["ttl_seconds"]))
+        if operation == "cancel":
+            exact(payload, ("lease",))
+            return self.controller.cancel(client_id, token, contract(RequestLease, payload["lease"]))
         if operation == "override":
             return self.controller.override(client_id, token, contract(OverrideCommand, payload))
+        if operation == "complete_model_load":
+            exact(payload, ("grant", "turn_id", "successful"))
+            identity(payload["turn_id"])
+            if type(payload["successful"]) is not bool:
+                raise ValueError("explicit completion flag required")
+            return self._transition(operation, client_id, token, contract(Grant, payload["grant"]),
+                                    payload["turn_id"], payload["successful"])
         exact(payload, ("grant",) if operation == "finish" else ("grant", "turn_id"))
         grant = contract(Grant, payload["grant"])
         if operation == "finish":
             return self._transition("finish", client_id, token, grant)
         identity(payload["turn_id"])
+        if operation == "begin_model_load":
+            return self._transition(operation, client_id, token, grant, payload["turn_id"])
         return getattr(self.controller, operation)(client_id, token, grant, payload["turn_id"])
 
     def _admit(self):

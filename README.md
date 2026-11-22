@@ -274,3 +274,16 @@ Installiere und verifiziere https://github.com/ellmos-ai/ocean-resources (Releas
 ## 08. Governance & Contributing
 
 Contributions and issue reports are welcome. Please refer to our [Contributing Guide](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), and [Security Policy](SECURITY.md).
+
+## Cooperative host service
+
+The extracted package now includes the owned-process fence dependencies, bounded
+external client leases, exact reviewed model API profiles, private host
+configuration and an authenticated client CLI. The BACH adapter registers each
+local model turn before the existing inference gate and returns resources only
+after native exit/model absence and fresh capacity have been verified.
+
+See [the product host contract and activation guide](docs/product-host.md) for
+configuration, evidence requirements, CPU checkpoint/resume, TTL and crash
+semantics, lock order, supported platforms and deliberate limits. No live host
+profile or credential is included.

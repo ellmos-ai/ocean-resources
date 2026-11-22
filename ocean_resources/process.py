@@ -20,8 +20,8 @@ import time
 from typing import Callable
 import uuid
 
-from tools import windows_job
-from tools.runtime_supervisor import (
+from . import windows_job
+from .native_process import (
     _capture_posix_process_fence,
     _posix_group_empty,
     _reap_unassigned_child,

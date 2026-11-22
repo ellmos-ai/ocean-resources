@@ -3,7 +3,7 @@ from dataclasses import asdict, dataclass, field
 from http.client import HTTPConnection
 import json
 
-from .contracts import Hold, identity
+from .contracts import Hold, RequestLease, identity
 from .service import LIMIT, OPERATIONS, SCHEMA, decode_json
 
 
@@ -57,6 +57,53 @@ class HostClient:
 
     def status(self):
         return self.call("status")
+
+    def submit_leased(self, request, ttl_seconds=60):
+        return self._submit_lease("submit_leased", request, ttl_seconds)
+
+    def submit_model_load(self, request, ttl_seconds=60):
+        return self._submit_lease("submit_model_load", request, ttl_seconds)
+
+    def _submit_lease(self, operation, request, ttl_seconds):
+        value = self.call(operation, {"request": asdict(request), "ttl_seconds": ttl_seconds})
+        receipt = RequestLease(**value)
+        if receipt.authority_id != self.authority_id or receipt.request_id != request.request_id:
+            raise Hold("host returned an unrelated client lease")
+        return receipt
+
+    def request_status(self, request_id):
+        identity(request_id)
+        value = self.call("request_status", {"request_id": request_id})
+        receipt = RequestLease(**value["lease"])
+        if (receipt.authority_id != self.authority_id or receipt.request_id != request_id
+                or value.get("schema") != "ocean-client-request.v1"):
+            raise Hold("host returned an unrelated request observation")
+        return value
+
+    def renew(self, lease, renewal_id, ttl_seconds=60):
+        value = self.call("renew", {"lease": asdict(lease), "renewal_id": renewal_id,
+                                    "ttl_seconds": ttl_seconds})
+        receipt = RequestLease(**value)
+        if (receipt.authority_id != lease.authority_id or receipt.request_id != lease.request_id
+                or receipt.generation != lease.generation + 1):
+            raise Hold("host returned an unrelated renewal")
+        return receipt
+
+    def cancel(self, lease):
+        return self.call("cancel", {"lease": asdict(lease)})
+
+    def begin_model_load(self, grant, turn_id):
+        return self.call("begin_model_load", {"grant": asdict(grant), "turn_id": turn_id})
+
+    def complete_model_load(self, grant, turn_id, successful):
+        value = self.call("complete_model_load", {"grant": asdict(grant), "turn_id": turn_id,
+                                                   "successful": successful})
+        receipt = RequestLease(**value["lease"])
+        if (receipt.authority_id != grant.authority_id or receipt.request_id != grant.request_id
+                or value.get("grant") != asdict(grant)
+                or value.get("model_load", {}).get("turn_id") != turn_id):
+            raise Hold("host returned an unrelated model load completion")
+        return value
 
     def begin_turn(self, grant, turn_id):
         return self.call("begin_turn", {"grant": asdict(grant), "turn_id": turn_id})

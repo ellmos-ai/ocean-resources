@@ -128,6 +128,21 @@ class Grant:
 
 
 @dataclass(frozen=True)
+class RequestLease:
+    """Client-owned lifetime; distinct from the host execution heartbeat."""
+    authority_id: str
+    request_id: str
+    generation: int
+    expires_at: float
+
+    def __post_init__(self):
+        identity(self.authority_id)
+        identity(self.request_id)
+        if not positive(self.generation) or not instant(self.expires_at):
+            raise ValueError("invalid fenced client lease")
+
+
+@dataclass(frozen=True)
 class Checkpoint:
     grant: Grant
     payload_json: str
