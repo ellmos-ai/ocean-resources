@@ -20,7 +20,6 @@ from ocean_resources import (
     BACHFacade,
     CapacityReadback,
     ControllerClient,
-    DARWIN_VM_STAT_SOURCE,
     DarwinVmStatSample,
     DarwinWiredWeightRunner,
     DurableRetirement,
@@ -595,7 +594,7 @@ def test_parse_darwin_vm_stat_output_exact_projection_and_rejections():
         parse_darwin_vm_stat_output(sample_stdout, expected_page_size=4096)
     with pytest.raises(Hold, match="platform_sample_schema"):
         parse_darwin_vm_stat_output(sample_stdout + "Pages free: 1.\n", expected_page_size=16384)
-    missing_spec = "\n".join(l for l in sample_stdout.splitlines() if "speculative" not in l)
+    missing_spec = "\n".join(line for line in sample_stdout.splitlines() if "speculative" not in line)
     with pytest.raises(Hold, match="platform_available_fields_missing"):
         parse_darwin_vm_stat_output(missing_spec, expected_page_size=16384)
 

@@ -1,6 +1,35 @@
+# Python & Build Artifacts
 __pycache__/
 *.py[cod]
-.pytest_cache/
+*$py.class
 *.egg-info/
+.eggs/
 dist/
 build/
+
+# Virtual Environments
+.venv/
+venv/
+ENV/
+
+# Testing, Coverage & Tool Caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.prof
+
+# Internal Agent / Bot Logs & Lock Defense
+*MARKETING-LOG.txt
+*STATUS-LOG.txt
+LOCK.txt
+LOCK.*.txt
+LOCK-CACHE.*
+LOCK.permissions.*
+TEST.txt
+TESTS.txt
+.claude/
+.gemini/
+.cursor/

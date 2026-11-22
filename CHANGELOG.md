@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added (2026-11-14, Path A Hygiene)
+- Cross-platform CI workflow (`.github/workflows/ci.yml`) testing Python 3.11–3.13 across `ubuntu-latest`, `windows-latest`, and `macos-latest` with whitespace, `ruff`, `compileall`, CLI resource smoke checks, and `pytest` gates.
+- GitHub community & dependency governance: `.github/dependabot.yml` (`github-actions` + security `pip`) and bilingual `.github/ISSUE_TEMPLATE/` (`bug_report.md`, `feature_request.md`).
+- Packaging & PEP 621/639 completeness: `MANIFEST.in`, `license-files = ["LICENSE"]`, non-license PyPI classifiers, expanded `[project.urls]`, `[project.optional-dependencies]` (`dev`), `[tool.setuptools.package-data]` (`manifest.json`, `pipeline-catalog.json`), `[tool.ruff]`, and hardened `[tool.pytest.ini_options]` (`--strict-markers`, `--strict-config`, `xfail_strict = true`).
+- Hardened `.gitignore` with fleet lock defense (`LOCK*.txt`, `LOCK-CACHE.*`, `LOCK.permissions.*`), internal log exclusions, and tool/venv caches.
+- Expanded metadata contract tests in `tests/test_metadata.py` (CI matrix, Dependabot, Issue templates, `.gitignore` lock defense, LLM install guidance, and packaged JSON resource smoke checks).
+- Bilingual LLM installation prompt section (`Install with your LLM` / `Mit deinem LLM installieren`) in `README.md` and `README_de.md`, machine-readable install/verification commands in `llms.txt`, and updated test/verification badges (version `0.2.0` preserved per freeze).
+
 ### Added (2026-11-08, PB-26)
 - `RunCooldownGate`, `RunCooldownPolicy` and `CooldownDecision` in `ram_distributor.py`: admission before each run of a local large consumer with the reasons `cooldown:swap` (swap-out rate above 32 MiB/min or memory pressure above normal), `cooldown:thermal` (`pmset -g therm` warning) and `cooldown:min` (60 s minimum pause). A failed probe drops only its own criterion, so unknown swap never blocks permanently.
 - `StressSample` and read-only `sample_stress()` in `host.py` (`vm_stat` Swapouts, `sysctl kern.memorystatus_vm_pressure_level`, `pmset -g therm`; no sudo, no writes).

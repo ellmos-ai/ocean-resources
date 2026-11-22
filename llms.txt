@@ -1,7 +1,7 @@
 # ocean-resources
 
 > Canonical RAM distributor, model runtime scheduler, torch arbiter, and watchdog hysteresis for BACH & Ocean.
-> Last-checked: 2026-11-04 | Version: 0.2.0
+> Last-checked: 2026-11-14 | Version: 0.2.0
 
 ## Overview
 
@@ -13,6 +13,13 @@
 - **Documentation**: https://github.com/ellmos-ai/ocean-resources#readme
 - **Architectural Reference**: Two-Stage Resource Claiming (Decision 2026-10-24, Issues #2441, #1949, #2027, #2028, #2152, #2308-#2311, #2334, #2419)
 
+## Installation & Verification (Machine-Readable)
+
+- **Prerequisites**: Python >= 3.11, `pip` (offline-first, zero external runtime dependencies).
+- **Install Command**: `python -m venv .venv && .venv/bin/pip install -e ".[dev]"` (Windows: `.venv\Scripts\pip install -e ".[dev]"`)
+- **Verification Command**: `python -m pytest && python -m ocean_resources manifest && python -m ocean_resources catalog`
+- **Minimal Example**: See Key Python Interfaces below and `SKILL.md`.
+
 ## Architecture & Two-Stage Claiming
 
 1. **Stage 1: RAM Distribution (`ocean_resources.ram_distributor.RAMDistributor`)**
@@ -20,6 +27,7 @@
    - Consumers declare `ConsumerCapability` (`weights_ram_bytes`, `kv_reserve_bytes`, `can_yield_at_turn_boundary`, `can_checkpoint`, `fallback_chain`).
    - Tendency steering: `"ollama"` (AI agent priority) vs `"compute"` (background compute pipelines).
    - Sensor hysteresis: `WatchdogHysteresisPolicy` protects cold-start model loads (90s grace window) while preserving emergency memory safeguards (<512 MiB floor).
+   - Run cooldown admission: `RunCooldownGate` & `RunCooldownPolicy` evaluate swap-out rate, memory pressure, thermal state (`sample_stress()`), and minimum pause before admitting local large consumers.
 
 2. **Stage 2: Model Runtime & Turn Claiming (`ocean_resources.inference_queue_policy`)**
    - Pure snapshot selection via `select_next_ticket`; the host owns queue state, validated target bindings, process coordination and dispatch.
@@ -37,6 +45,7 @@ from ocean_resources import (
     ConsumerCapability,
     DistributorRequest,
     RAMDistributor,
+    RunCooldownGate,
     UserProximity,
     WatchdogHysteresisPolicy,
     QueueTicket,

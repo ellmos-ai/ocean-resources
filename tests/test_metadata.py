@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+from fnmatch import fnmatchcase
+from importlib.resources import files
+import json
 from pathlib import Path
 import re
 import tomllib
@@ -25,12 +28,28 @@ def test_version_freeze_and_pep639():
     # PEP 639 License conformity
     license_val = project.get("license")
     assert license_val == "MIT", "License must be MIT"
+    assert "LICENSE" in project.get("license-files", []), "license-files must include LICENSE"
 
     classifiers = project.get("classifiers", [])
+    assert classifiers, "PEP 621 classifiers should be populated"
     for c in classifiers:
         assert not c.startswith("License ::"), (
             f"PEP 639 violation: redundant/contradictory license classifier found: {c}"
         )
+
+    urls = project.get("urls", {})
+    for key in ("Homepage", "Documentation", "Repository", "Issues", "Changelog", "Security", "Code of Conduct"):
+        assert key in urls and urls[key].startswith("https://"), f"Missing or invalid project URL: {key}"
+
+    package_data = data.get("tool", {}).get("setuptools", {}).get("package-data", {})
+    pkg_files = package_data.get("ocean_resources", [])
+    for name in ("manifest.json", "pipeline-catalog.json"):
+        assert any(fnmatchcase(name, pattern) for pattern in pkg_files), f"{name} must be covered by package-data"
+
+    pytest_cfg = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
+    assert pytest_cfg.get("xfail_strict") is True, "pytest xfail_strict must be enabled"
+    addopts = pytest_cfg.get("addopts", [])
+    assert "--strict-markers" in addopts, "pytest --strict-markers must be enabled"
 
 
 def test_mandatory_governance_and_discoverability_files_exist():
@@ -39,6 +58,7 @@ def test_mandatory_governance_and_discoverability_files_exist():
         "README_de.md",
         "CHANGELOG.md",
         "LICENSE",
+        "MANIFEST.in",
         "SECURITY.md",
         "CODE_OF_CONDUCT.md",
         "CONTRIBUTING.md",
@@ -83,3 +103,88 @@ def test_mermaid_diagram_syntax_guardrails():
                 # In sequence diagrams, semicolons in messages are forbidden
                 if "->" in line:
                     assert ";" not in line, f"Semicolon in sequence diagram message: {line}"
+
+
+def test_ci_workflow_matrix_and_guardrails():
+    ci_path = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+    assert ci_path.exists(), ".github/workflows/ci.yml must exist"
+    ci_text = ci_path.read_text(encoding="utf-8")
+
+    for expected in (
+        "workflow_dispatch:",
+        "contents: read",
+        "fail-fast: false",
+        "ubuntu-latest",
+        "windows-latest",
+        "macos-latest",
+        '"3.11"',
+        '"3.12"',
+        '"3.13"',
+        "git diff --check",
+        "ruff check",
+        "compileall",
+        "pytest",
+    ):
+        assert expected in ci_text, f"CI workflow missing required element: {expected}"
+
+
+def test_dependabot_and_issue_templates_exist():
+    dependabot_path = REPO_ROOT / ".github" / "dependabot.yml"
+    assert dependabot_path.exists(), ".github/dependabot.yml must exist"
+    dep_text = dependabot_path.read_text(encoding="utf-8")
+    assert 'package-ecosystem: "github-actions"' in dep_text
+    assert 'package-ecosystem: "pip"' in dep_text
+
+    for template_name in ("bug_report.md", "feature_request.md"):
+        tpl = REPO_ROOT / ".github" / "ISSUE_TEMPLATE" / template_name
+        assert tpl.exists(), f"Missing issue template: {template_name}"
+        assert tpl.stat().st_size > 0
+
+
+def test_gitignore_lock_and_log_defense():
+    gitignore = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8")
+    for pattern in (
+        "LOCK.txt",
+        "LOCK.*.txt",
+        "LOCK-CACHE.*",
+        "*MARKETING-LOG.txt",
+        ".venv/",
+        ".ruff_cache/",
+        ".coverage",
+    ):
+        assert pattern in gitignore, f".gitignore must ignore {pattern}"
+
+
+def test_llm_installation_guidance_present():
+    import re
+
+    en_readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    de_readme = (REPO_ROOT / "README_de.md").read_text(encoding="utf-8")
+    llms_txt = (REPO_ROOT / "llms.txt").read_text(encoding="utf-8")
+
+    assert "### Install with your LLM" in en_readme
+    assert "Install and verify https://github.com/ellmos-ai/ocean-resources" in en_readme
+    assert "### Mit deinem LLM installieren" in de_readme
+
+    for doc_name, content in (("README.md", en_readme), ("README_de.md", de_readme)):
+        assert "llms.txt" in content and "SKILL.md" in content, f"{doc_name} must reference llms.txt and SKILL.md"
+        assert not re.search(r"\bcurl\s+[^\n`]+\|\s*(?:sh|bash)\b", content, re.IGNORECASE), (
+            f"{doc_name} must not recommend curl|sh"
+        )
+
+    for section in ("Prerequisites", "Install", "Verification", "python -m pytest"):
+        assert section in llms_txt, f"llms.txt missing machine-readable guidance: {section}"
+
+
+def test_packaged_json_resources_and_cli_smoke():
+    pkg = files("ocean_resources")
+    manifest_data = json.loads(pkg.joinpath("manifest.json").read_text(encoding="utf-8"))
+    catalog_data = json.loads(pkg.joinpath("pipeline-catalog.json").read_text(encoding="utf-8"))
+
+    assert manifest_data.get("schema") == "ellmos.ocean-resource-seam.v1"
+    assert catalog_data.get("schema") == "ocean-pipeline-catalog.v1"
+
+    from ocean_resources.__main__ import main
+
+    assert main(["manifest"]) == 0
+    assert main(["catalog"]) == 0

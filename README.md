@@ -1,10 +1,11 @@
 # ocean-resources — RAM Distributor & Model Runtime Scheduler
 
 [![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue.svg)](pyproject.toml)
+[![CI](https://github.com/ellmos-ai/ocean-resources/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests: Passing](https://img.shields.io/badge/tests-17%2F17%20passing%20%7C%20100%25%20green-success.svg)](tests/)
-[![Verified: 2026-11-04](https://img.shields.io/badge/verified-2026--11--04-brightgreen.svg)](_reg/hosts/WORKSTATION-LG/CHECK-REG.txt)
+[![Tests: Passing](https://img.shields.io/badge/tests-32%2F32%20passing%20%7C%20100%25%20green-success.svg)](tests/)
+[![Verified: 2026-11-14](https://img.shields.io/badge/verified-2026--11--14-brightgreen.svg)](tests/test_metadata.py)
 [![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
 > **Languages / Sprachen:** [English](README.md) | [Deutsch](README_de.md)
@@ -38,7 +39,7 @@ Unified arbitration of physical host memory (RAM/VRAM), dynamic model residence,
 ---
 
 <a id="sec-02"></a>
-## 02. Target Architecture vs. Implementation State (As of 2026-11-04)
+## 02. Target Architecture vs. Implementation State (As of 2026-11-14)
 
 | Domain | Target Architecture | Implementation State |
 |---|---|---|
@@ -247,10 +248,24 @@ sequenceDiagram
 git clone https://github.com/ellmos-ai/ocean-resources.git
 cd ocean-resources
 
-# 2. Run test suites and linters
+# 2. Install editable package with dev tools in an isolated venv
+python -m venv .venv
+python -m pip install -e ".[dev]"
+
+# 3. Run test suites, linters, and offline CLI smoke checks
 python -m pytest
 ruff check .
-python -m compileall .
+python -m compileall -q ocean_resources tests
+python -m ocean_resources manifest
+```
+
+### Install with your LLM
+
+```text
+Install and verify https://github.com/ellmos-ai/ocean-resources (prefer a release tag or commit pin; never run unreviewed curl|sh pipes):
+1. Read llms.txt and SKILL.md in the repository root first.
+2. Create an isolated virtual environment (.venv) and run the install command from llms.txt.
+3. Verify the installation with the verification command (python -m pytest && python -m ocean_resources manifest) and report the result.
 ```
 
 ---
