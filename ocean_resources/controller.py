@@ -277,17 +277,21 @@ class HostController(ClientLeaseLifecycle):
         identity(turn_id)
         with self._mutex:
             self._owned_model_load(client, grant)
+            state = self.arbiter.load_state(grant)
+            if (self._materialization is not None and self._materialization[:2] == (grant, turn_id)
+                    and state is not None and state["turn_id"] == turn_id):
+                return {"state": self._materialization[2], "grant": asdict(grant), "turn_id": turn_id}
         loader, execution_id = self.facade.model_loader(grant)
         if not loader.supports_materialization:
             raise Hold("native model port does not support in-process materialization")
-        if not self._transition_lock.acquire(blocking=False):
+        if not self._transition_lock.acquire(timeout=0.05):
             raise Hold("controller handoff is in progress")
         try:
             with self._mutex:
                 entry = self._owned_model_load(client, grant)
                 state = self.arbiter.load_state(grant)
                 if (self._materialization is not None and self._materialization[:2] == (grant, turn_id)
-                        and state["turn_id"] == turn_id):
+                        and state is not None and state["turn_id"] == turn_id):
                     return {"state": self._materialization[2], "grant": asdict(grant), "turn_id": turn_id}
                 if (state["phase"] != "MAY_LOAD" or state["turn_id"] != turn_id or turn_id not in self._turns
                         or entry["terminal"] or self._now() >= entry["receipt"].expires_at
