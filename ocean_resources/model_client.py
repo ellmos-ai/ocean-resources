@@ -114,7 +114,7 @@ async def model_turn(client, socket_id, slot_id, priority, *, wait_seconds=300, 
 
         renewal = asyncio.create_task(heartbeat())
         # Caller still owns all normal reserve/cold-start/task/budget checks.
-        yield {"grant": asdict(grant), "lease": asdict(lease), "renewal": renewal}
+        yield {"grant": asdict(grant), "turn_id": turn_id, "lease": asdict(lease), "renewal": renewal}
     finally:
         async def settle():
             nonlocal lease, turn_started

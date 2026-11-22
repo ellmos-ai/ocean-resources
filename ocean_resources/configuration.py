@@ -16,7 +16,7 @@ from .capacity import CapacityPolicy, NativeCapacitySensor
 from .client import HostClient
 from .contracts import Hold, ResourceSocket, identity
 from .controller import ControllerClient, FocusPolicy, HostController
-from .model_executor import ModelAPIExecutor, ModelSpec
+from .model_executor import MLXModelSpec, ModelAPIExecutor, ModelSpec
 from .process import OwnedProcessExecutor, ProcessCommand
 from .profiles import ProfileSource, ReviewedProfileGate
 from .service import HostService, decode_json, exact
@@ -121,7 +121,9 @@ class ConfiguredHost:
                 gate.require(socket)
             cap = dict(config["capacity"])
             cap["directory"] = Path(cap["directory"])
-            sensor = NativeCapacitySensor(CapacityPolicy(**cap), config["host_id"])
+            mlx_capacity = any(item["kind"] == "model-mlx" for item in config["executors"])
+            options = {"use_platform_vm_stat": True} if mlx_capacity else {}
+            sensor = NativeCapacitySensor(CapacityPolicy(**cap), config["host_id"], **options)
             self.writer = self._stack.enter_context(HostWriterAuthority(state, config["host_id"]))
             self.arbiter = HostLocalArbiter(self.writer, sockets, sensor, time.monotonic,
                 heartbeat_ttl=30, profile_gate=gate)
@@ -130,16 +132,44 @@ class ConfiguredHost:
                 socket_id = identity(item["socket_id"])
                 if socket_id in adapters:
                     raise Hold("duplicate executor socket")
-                if item["kind"] == "model-api":
-                    exact(item, {"socket_id", "kind", "model"} | ({"load_policy_sha256"} if "load_policy_sha256" in item else set()))
-                    spec = ModelSpec(**item["model"])
-                    load_policy = item.get("load_policy_sha256")
-                    port = model_port_factory()
+                socket = next((s for s in sockets if s.socket_id == socket_id), None)
+                if socket is None:
+                    raise Hold("executor has no reviewed socket")
+                if item["kind"] in {"model-api", "model-mlx"}:
+                    mlx = item["kind"] == "model-mlx"
+                    if mlx:
+                        exact(item, ("socket_id", "kind", "model", "load_policy_sha256", "model_store", "headroom_bytes"))
+                        from .mlx_model_port import InProcessQwenPort
+                        from .mlx_qwen import build_qwen_text_plan
+
+                        spec = MLXModelSpec(**item["model"])
+                        if platform.system() != "Darwin" or platform.machine() != "arm64":
+                            raise Hold("wired MLX requires Apple Silicon macOS")
+                        store = Path(item["model_store"])
+                        if not store.is_absolute() or store.resolve() != store or not store.is_dir():
+                            raise Hold("explicit canonical Qwen model store required")
+                        load_policy = item["load_policy_sha256"]
+                        if socket.workload_sha256 != spec.fingerprint():
+                            raise Hold("MLX executor differs from its reviewed socket workload")
+                        gate.require_model_load(socket)
+                        plan = build_qwen_text_plan(store, model=spec.model, model_digest=spec.digest)
+                        if plan.wired_bytes + plan.subpage_bytes > socket.ram_bytes:
+                            raise Hold("Qwen weights exceed the reviewed socket allocation")
+                        port = InProcessQwenPort(spec, plan, policy_sha256=load_policy,
+                                                 headroom_bytes=item["headroom_bytes"])
+                    else:
+                        exact(item, {"socket_id", "kind", "model"} |
+                              ({"load_policy_sha256"} if "load_policy_sha256" in item else set()))
+                        spec = ModelSpec(**item["model"])
+                        load_policy = item.get("load_policy_sha256")
+                        port = model_port_factory()
                     if load_policy is not None and getattr(port, "supports_load_pending", False) is not True:
                         raise Hold("native model residency accounting contract is unavailable; LOAD_PENDING is disabled")
                     executor = ModelAPIExecutor(self.arbiter, spec, port, state,
                                                 load_policy_sha256=load_policy)
                     model = {"socket_id": socket_id, **asdict(spec)}
+                    if mlx:
+                        model["backend"] = "mlx-qwen"
                     if load_policy is not None:
                         model["load_policy_sha256"] = load_policy
                     models.append(model)
@@ -155,8 +185,7 @@ class ConfiguredHost:
                 else:
                     raise Hold("unsupported configured executor")
                 adapters[socket_id] = executor.adapter()
-                socket = next((s for s in sockets if s.socket_id == socket_id), None)
-                if socket is None or socket.workload_sha256 != adapters[socket_id].workload_sha256:
+                if socket.workload_sha256 != adapters[socket_id].workload_sha256:
                     raise Hold("executor differs from the reviewed socket workload")
                 self._executors.append(executor)
             if set(adapters) != {s.socket_id for s in sockets}:

@@ -95,6 +95,14 @@ class HostClient:
     def begin_model_load(self, grant, turn_id):
         return self.call("begin_model_load", {"grant": asdict(grant), "turn_id": turn_id})
 
+    def materialize_model_load(self, grant, turn_id):
+        identity(turn_id)
+        value = self.call("materialize_model_load", {"grant": asdict(grant), "turn_id": turn_id})
+        if (value.get("grant") != asdict(grant) or value.get("turn_id") != turn_id
+                or value.get("state") not in {"LOADING", "READY", "FAILED"}):
+            raise Hold("host returned an unrelated materialization readback")
+        return value
+
     def complete_model_load(self, grant, turn_id, successful):
         value = self.call("complete_model_load", {"grant": asdict(grant), "turn_id": turn_id,
                                                    "successful": successful})
@@ -103,6 +111,20 @@ class HostClient:
                 or value.get("grant") != asdict(grant)
                 or value.get("model_load", {}).get("turn_id") != turn_id):
             raise Hold("host returned an unrelated model load completion")
+        return value
+
+    def generate_model(self, grant, turn_id, prompt, max_new_tokens, *, stop_tokens=()):
+        identity(turn_id)
+        value = self.call("generate_model", {"grant": asdict(grant), "turn_id": turn_id,
+                                              "prompt": list(prompt), "max_new_tokens": max_new_tokens,
+                                              "stop_tokens": list(stop_tokens)})
+        state, tokens = value.get("state"), value.get("tokens")
+        if (value.get("grant") != asdict(grant) or value.get("turn_id") != turn_id
+                or state not in {"RUNNING", "COMPLETE", "FAILED"}
+                or (state == "COMPLETE") != isinstance(tokens, list)
+                or tokens is not None and (not isinstance(tokens, list) or len(tokens) > max_new_tokens
+                    or any(type(token) is not int or not 0 <= token <= 0x7fffffff for token in tokens))):
+            raise Hold("host returned an unrelated native generation readback")
         return value
 
     def begin_turn(self, grant, turn_id):

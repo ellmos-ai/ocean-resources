@@ -35,7 +35,7 @@ class ClientLeaseLifecycle:
                 raise Hold("request identity exists or lease history requires explicit archival")
             receipt = RequestLease(self._authority_id, request.request_id, 1, now + ttl)
             self._audit("client-lease-submitted", client_id=client_id, lease=asdict(receipt))
-            self._submit(client, request)
+            self._submit(client, request, model_load=_model_load)
             self._leases[request.request_id] = {
                 "request": request, "initial_ttl": ttl, "receipt": receipt,
                 "terminal": None, "renewals": {}, "model_load": _model_load,
@@ -84,11 +84,23 @@ class ClientLeaseLifecycle:
                 raise Hold("request has no client lease")
             active = self._active if self._active and self._active.request_id == request_id else None
             state = ("RETURN_REQUESTED" if self._return else "RUNNING") if active else (entry["terminal"] or "QUEUED")
-            load = self.arbiter.load_state(active) if active else None
+            grant = asdict(active) if active else None
+            load = None
+            if active is not None:
+                try:
+                    load = self.arbiter.load_state(active)
+                except Hold:
+                    # Native release can finish before the controller reacquires
+                    # its mutex to settle the lease. Keep the return in progress.
+                    transition = self._transition or {}
+                    if (state != "RETURN_REQUESTED" or transition.get("action") != "return"
+                            or transition.get("grant") != grant
+                            or self.arbiter.status()["torch"] is not None):
+                        raise
             if load and load["phase"] in {"PREPARED", "MAY_LOAD", "RECOVERY_HOLD"}:
                 state = "RECOVERY_HOLD" if load["phase"] == "RECOVERY_HOLD" else "RETURN_REQUESTED" if self._return else "LOAD_PENDING"
             return {"schema": "ocean-client-request.v1", "state": state,
-                    "lease": asdict(entry["receipt"]), "grant": asdict(active) if active else None,
+                    "lease": asdict(entry["receipt"]), "grant": grant,
                     "model_load": load,
                     "expires_in_seconds": max(0, entry["receipt"].expires_at - self._now())}
 

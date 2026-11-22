@@ -14,7 +14,8 @@ SCHEMA = "ocean-host-transport.v1"
 LIMIT = 1024 * 1024
 OPERATIONS = frozenset({"status", "submit", "submit_leased", "renew", "cancel", "request_status",
                         "begin_turn", "end_turn", "override", "finish", "tick",
-                        "submit_model_load", "begin_model_load", "complete_model_load"})
+                        "submit_model_load", "begin_model_load", "materialize_model_load",
+                        "complete_model_load", "generate_model"})
 
 
 def decode_json(raw: bytes) -> dict:
@@ -269,6 +270,11 @@ class HostService:
             return self.controller.cancel(client_id, token, contract(RequestLease, payload["lease"]))
         if operation == "override":
             return self.controller.override(client_id, token, contract(OverrideCommand, payload))
+        if operation == "generate_model":
+            exact(payload, ("grant", "turn_id", "prompt", "max_new_tokens", "stop_tokens"))
+            return self.controller.generate_model(client_id, token, contract(Grant, payload["grant"]),
+                                                  payload["turn_id"], payload["prompt"],
+                                                  payload["max_new_tokens"], payload["stop_tokens"])
         if operation == "complete_model_load":
             exact(payload, ("grant", "turn_id", "successful"))
             identity(payload["turn_id"])

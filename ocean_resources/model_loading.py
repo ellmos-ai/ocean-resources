@@ -6,10 +6,11 @@ residency credit must describe attributable, private, non-reclaimable host RAM
 in the same capacity observation. API size, total RSS and GPU/Metal allocation
 alone do not implement that contract and must leave ``credit`` absent.
 """
-from array import array
 from copy import deepcopy
 import ctypes as C
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, replace
+from functools import wraps
 import hashlib
 import json
 import os
@@ -179,6 +180,31 @@ def permit_unwire(epoch: WiredEpoch, readback: DurableRetirement | None) -> None
             or not isinstance(readback, DurableRetirement)
             or readback != DurableRetirement("RETIRED", epoch.scope, epoch.generation)):
         raise Hold("retirement has no exact durable readback")
+
+
+def wired_epoch_commitment(epoch: WiredEpoch | dict) -> dict:
+    """Commit to the full epoch without journaling every backing."""
+    raw = asdict(epoch) if isinstance(epoch, WiredEpoch) else epoch
+    encoded = json.dumps(raw, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {
+        "scope": raw["scope"],
+        "generation": raw["generation"],
+        "backing_count": len(raw["backings"]),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+
+
+def verified_wired_epoch(load_state):
+    """Return the journaled identity from a completed wired admission."""
+    if load_state is None or load_state["phase"] != "VERIFIED":
+        return None
+    credit = load_state["completion"]["observation"]["credit"]
+    if credit is None or credit["source"] != WIRED_CREDIT_SOURCE:
+        return None
+    proof = credit["wired_proof"]
+    if proof.get("schema") == "ocean-wired-epoch-commitment.v1":
+        return proof["epoch"]
+    return wired_epoch_commitment(proof["pre_commit_epoch"])
 
 
 @dataclass(frozen=True)
@@ -448,6 +474,21 @@ class ModelLoadLifecycle:
         if (cap.reading.available_ram_bytes < remaining
                 or observation.available_ram_bytes < cap.reserve_ram_bytes + observation.normal_headroom_bytes):
             raise Hold("loaded model lacks normal reserve and provable remaining peak capacity")
+        registered = state.get("registered_wired_epoch")
+        if observation.credit is not None and observation.credit.source == WIRED_CREDIT_SOURCE:
+            epoch = observation.credit.wired_proof.pre_commit_epoch
+            commitment = wired_epoch_commitment(epoch)
+            if registered is not None and registered != commitment:
+                raise Hold("verified wired epoch differs from registered backing")
+            recorded = asdict(replace(observation, credit=replace(observation.credit, wired_proof=None)))
+            recorded["credit"]["wired_proof"] = {
+                "schema": "ocean-wired-epoch-commitment.v1",
+                "epoch": commitment,
+            }
+        else:
+            if registered is not None:
+                raise Hold("registered wired epoch requires a wired residency proof")
+            recorded = asdict(observation)
         # A native read can block; repeat immutable approval and expiry checks.
         if self._load_profile(socket)["profile_sha256"] != state["profile_sha256"]:
             raise Hold("reviewed model profile changed during completion")
@@ -458,7 +499,7 @@ class ModelLoadLifecycle:
                                   active.metric_sequence, loading=False)):
             raise Hold("native load proof expired before durable commit")
         previous = deepcopy(state)
-        state.update(phase="VERIFIED", completion={"observation": _json_roundtrip(asdict(observation)),
+        state.update(phase="VERIFIED", completion={"observation": _json_roundtrip(recorded),
             "credited_bytes": credit, "remaining_ram_bytes": remaining}, reason=None)
         active.metric_sequence = cap.reading.sequence
         try:
@@ -607,19 +648,19 @@ class _DarwinMetalRuntime:
         "kernel void wired_verify_u32(\n"
         "    device const uint* w [[buffer(0)]],\n"
         "    device uint* out [[buffer(1)]],\n"
-        "    device const uint* meta [[buffer(2)]],\n"
+        "    device const ulong* meta [[buffer(2)]],\n"
         "    uint tid [[thread_position_in_grid]]) {\n"
-        "    uint count = meta[0];\n"
-        "    uint words_per_page = meta[1];\n"
-        "    uint pages = meta[2];\n"
+        "    ulong count = meta[0];\n"
+        "    ulong words_per_page = meta[1];\n"
+        "    ulong pages = meta[2];\n"
         "    uint s = 0u;\n"
-        "    for (uint i = tid; i < count; i += 256u) {\n"
+        "    for (ulong i = ulong(tid); i < count; i += 256ul) {\n"
         "        s += w[i];\n"
         "    }\n"
         "    uint pm = 0u;\n"
-        "    for (uint p = tid; p < pages; p += 256u) {\n"
+        "    for (ulong p = ulong(tid); p < pages; p += 256ul) {\n"
         "        uint first = w[p * words_per_page];\n"
-        "        uint last = w[(p + 1u) * words_per_page - 1u];\n"
+        "        uint last = w[(p + 1ul) * words_per_page - 1ul];\n"
         "        pm ^= ((first ^ last) + (p * 2654435761u));\n"
         "    }\n"
         "    out[tid * 2u] = s;\n"
@@ -712,6 +753,43 @@ class WiredWeightRegion:
     gpu_verified: bool = False
 
 
+@dataclass(frozen=True, eq=False)
+class WiredWeightLease:
+    """Identity-scoped access to a runner-owned, immutable weight mapping."""
+
+    tensor_name: str
+    address: int
+    raw_bytes: int
+
+
+def _serialized_wired_runner(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if self._pid != os.getpid():
+            raise Hold("foreign_wired_runner_process")
+        with self._wire_lock:
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
+@contextmanager
+def _metal_autorelease_pool(runtime):
+    pool = runtime.objc.objc_autoreleasePoolPush()
+    try:
+        yield
+    finally:
+        if pool:
+            runtime.objc.objc_autoreleasePoolPop(pool)
+
+
+def _with_metal_autorelease_pool(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with _metal_autorelease_pool(self._rt):
+            return method(self, *args, **kwargs)
+    return wrapped
+
+
 class DarwinWiredWeightRunner:
     """Cooperative Apple Silicon weight runner backing ResidentCredit v2.
 
@@ -725,31 +803,34 @@ class DarwinWiredWeightRunner:
     def __init__(self, *, max_total_bytes: int = 512 * 1024 * 1024):
         if not positive(max_total_bytes):
             raise ValueError("positive max_total_bytes required")
+        self._pid = os.getpid()
+        self._wire_lock = threading.Lock()
+        self._weight_leases: set[WiredWeightLease] = set()
         self._rt = _get_metal_runtime()
-        self._max_total_bytes = max_total_bytes
-        self._total_mapped_bytes = 0
-        self._pool = self._rt.objc.objc_autoreleasePoolPush()
-        self._device = self._rt.metal.MTLCreateSystemDefaultDevice()
-        if not self._device or not self._rt.send(C.c_bool, self._device, "hasUnifiedMemory"):
-            self._pop_pool_only()
-            raise Hold("unified_metal_device_required")
-        self._max_buffer_len = self._rt.send(C.c_ulong, self._device, "maxBufferLength")
-        self._refs: list[int] = []
-        self._pipeline: int | None = None
-        self._queue: int | None = None
-        self._regions: dict[str, WiredWeightRegion] = {}
-        self._views: dict[str, str] = {}
-        self._generation = 0
-        self._wire_completed_ns: int | None = None
-        self._bound_scope: WiredScope | None = None
-        self._active_epoch: WiredEpoch | None = None
-        self._retired = False
-        self._gpu_commit_uncertain = False
-
-    def _pop_pool_only(self):
-        if self._pool:
-            self._rt.objc.objc_autoreleasePoolPop(self._pool)
-            self._pool = None
+        with _metal_autorelease_pool(self._rt):
+            self._max_total_bytes = max_total_bytes
+            self._total_mapped_bytes = 0
+            self._device = self._rt.metal.MTLCreateSystemDefaultDevice()
+            if not self._device or not self._rt.send(C.c_bool, self._device, "hasUnifiedMemory"):
+                raise Hold("unified_metal_device_required")
+            self._max_buffer_len = self._rt.send(C.c_ulong, self._device, "maxBufferLength")
+            self._refs: list[int] = []
+            self._pipeline: int | None = None
+            self._queue: int | None = None
+            self._regions: dict[str, WiredWeightRegion] = {}
+            self._views: dict[str, str] = {}
+            self._generation = 0
+            self._wire_completed_ns: int | None = None
+            self._bound_scope: WiredScope | None = None
+            self._active_epoch: WiredEpoch | None = None
+            self._retired = False
+            self._gpu_commit_uncertain = False
+            self._teardown_started = False
+            self._metal_deallocated_ns: dict[str, int] = {}
+            self._munlocked_regions: set[str] = set()
+            self._unmapped_regions: set[str] = set()
+            self._munlock_started_ns: int | None = None
+            self._wire_ended_ns: int | None = None
 
     def _ensure_compute_pipeline(self):
         if self._pipeline is not None and self._queue is not None:
@@ -803,6 +884,31 @@ class DarwinWiredWeightRunner:
     def regions(self) -> dict[str, WiredWeightRegion]:
         return dict(self._regions)
 
+    @_serialized_wired_runner
+    def borrow_weight(self, tensor_name: str) -> WiredWeightLease:
+        """Hold a backing until the inference runtime releases its last reference.
+
+        The borrower must synchronize GPU work and dispose of every native
+        reference before returning the lease. Losing the lease holds teardown.
+        """
+        if self._retired or self._teardown_started or self._gpu_commit_uncertain:
+            raise Hold("wired_runner_unavailable_for_borrow")
+        region = self._regions.get(tensor_name) if isinstance(tensor_name, str) else None
+        if region is None:
+            raise Hold("unknown_wired_weight")
+        lease = WiredWeightLease(region.tensor_name, region.address, region.raw_bytes)
+        self._weight_leases.add(lease)
+        return lease
+
+    @_serialized_wired_runner
+    def release_weight(self, lease: WiredWeightLease) -> None:
+        """Acknowledge that the borrower no longer retains the backing."""
+        if not isinstance(lease, WiredWeightLease) or lease not in self._weight_leases:
+            raise Hold("unowned_or_released_wired_weight_lease")
+        self._weight_leases.remove(lease)
+
+    @_serialized_wired_runner
+    @_with_metal_autorelease_pool
     def load_safetensors(
         self,
         path: Path,
@@ -813,6 +919,8 @@ class DarwinWiredWeightRunner:
         """Load selected .safetensors tensors into mlock'd anonymous Metal bytesNoCopy buffers."""
         if self._retired:
             raise Hold("runner_already_retired")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if self._active_epoch is not None:
             raise Hold("cannot_mutate_weights_after_epoch_exported")
         path = Path(path)
@@ -849,13 +957,16 @@ class DarwinWiredWeightRunner:
                     if self._rt.libc.minherit(addr, mapped_len, 2) != 0:
                         raise Hold("mapping_inheritance_unconfirmed")
                     stream.seek(data_offset + info.data_start)
-                    raw = stream.read(nbytes)
-                    if len(raw) != nbytes:
-                        raise Hold("safetensors_tensor_read_truncated")
-                    C.memmove(addr, raw, nbytes)
+                    target = memoryview((C.c_ubyte * nbytes).from_address(addr)).cast("B")
+                    offset = 0
+                    while offset < nbytes:
+                        received = stream.readinto(target[offset:offset + 8 * 1024 * 1024])
+                        if not received:
+                            raise Hold("safetensors_tensor_read_truncated")
+                        offset += received
                     if mapped_len > nbytes:
                         C.memset(addr + nbytes, 0, mapped_len - nbytes)
-                    digest = hashlib.sha256(C.string_at(addr, nbytes)).hexdigest()
+                    digest = hashlib.sha256(target).hexdigest()
                     if self._rt.libc.mlock(addr, mapped_len) != 0:
                         raise Hold("mlock_failed_errno:" + str(C.get_errno()))
                     locked = True
@@ -903,20 +1014,27 @@ class DarwinWiredWeightRunner:
         self._wire_completed_ns = time.monotonic_ns()
         return loaded
 
+    @_serialized_wired_runner
     def register_tensor_view(self, view_name: str, base_tensor_name: str) -> None:
         """Register an aliased view sharing the exact physical allocation_id of base_tensor_name."""
         if self._retired or self._active_epoch is not None:
             raise Hold("cannot_register_view_after_epoch_exported")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if base_tensor_name not in self._regions:
             raise Hold("base_tensor_not_loaded")
         if view_name in self._regions or view_name in self._views:
             raise Hold("duplicate_view_name")
         self._views[view_name] = base_tensor_name
 
+    @_serialized_wired_runner
+    @_with_metal_autorelease_pool
     def verify_gpu_weight_read(self, tensor_name: str, *, timeout: float = 15.0) -> dict:
         """Execute a Metal compute pass reading every 32-bit word and page boundary of a wired tensor."""
         if self._retired:
             raise Hold("runner_already_retired")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if tensor_name not in self._regions:
             raise Hold("wired_tensor_not_found")
         region = self._regions[tensor_name]
@@ -928,9 +1046,10 @@ class DarwinWiredWeightRunner:
         whole_pages = region.whole_weight_pages
 
         # Compute exact CPU reference from the wired anonymous buffer.
-        raw_view = C.string_at(region.address, region.raw_bytes)
-        words = array("I")
-        words.frombytes(raw_view)
+        # The mapping stays wired throughout verification. Read it in place so
+        # large tensors do not require two more full-size host allocations.
+        raw_view = memoryview((C.c_ubyte * region.raw_bytes).from_address(region.address)).cast("B")
+        words = raw_view.cast("I")
         expected_sum = sum(words) & 0xFFFFFFFF
         expected_page_mix = 0
         for p in range(whole_pages):
@@ -941,14 +1060,14 @@ class DarwinWiredWeightRunner:
         out_buf = self._rt.send(C.c_void_p, self._device, "newBufferWithLength:options:",
                                 (C.c_ulong, C.c_ulong), (256 * 2 * 4, 0))
         meta_buf = self._rt.send(C.c_void_p, self._device, "newBufferWithLength:options:",
-                                 (C.c_ulong, C.c_ulong), (12, 0))
+                                 (C.c_ulong, C.c_ulong), (24, 0))
         if not out_buf or not meta_buf:
             if out_buf:
                 self._rt.send(None, out_buf, "release")
             if meta_buf:
                 self._rt.send(None, meta_buf, "release")
             raise Hold("metal_scratch_buffer_allocation_failed")
-        meta_arr = (C.c_uint32 * 3).from_address(self._rt.send(C.c_void_p, meta_buf, "contents"))
+        meta_arr = (C.c_uint64 * 3).from_address(self._rt.send(C.c_void_p, meta_buf, "contents"))
         meta_arr[0] = word_count
         meta_arr[1] = words_per_page
         meta_arr[2] = whole_pages
@@ -987,7 +1106,7 @@ class DarwinWiredWeightRunner:
             gpu_page_mix = 0
             for i in range(256):
                 gpu_page_mix ^= int(out_arr[i * 2 + 1])
-            after_sha = hashlib.sha256(C.string_at(region.address, region.raw_bytes)).hexdigest()
+            after_sha = hashlib.sha256(raw_view).hexdigest()
             if gpu_sum != expected_sum or gpu_page_mix != expected_page_mix or after_sha != region.weights_sha256:
                 raise Hold("gpu_weight_verification_mismatch")
             region.gpu_verified = True
@@ -1008,10 +1127,13 @@ class DarwinWiredWeightRunner:
                 self._rt.send(None, meta_buf, "release")
                 self._rt.send(None, out_buf, "release")
 
+    @_serialized_wired_runner
     def export_epoch(self, scope: WiredScope) -> WiredEpoch:
         """Export the immutable WiredEpoch bound to scope once all tensors are GPU-verified."""
         if self._retired:
             raise Hold("runner_already_retired")
+        if self._teardown_started:
+            raise Hold("runner_teardown_in_progress")
         if not isinstance(scope, WiredScope):
             raise Hold("wired_scope_required")
         if not self._regions or self._wire_completed_ns is None or self._generation <= 0:
@@ -1049,45 +1171,62 @@ class DarwinWiredWeightRunner:
     def _release_native_resources(self) -> dict:
         if self._gpu_commit_uncertain:
             raise Hold("gpu_terminal_unconfirmed_no_manual_unmap")
-        for ref in reversed(self._refs):
-            self._rt.send(None, ref, "release")
-        self._refs.clear()
-        self._pipeline = None
-        self._queue = None
-        self._pop_pool_only()
-        if self._device:
-            self._rt.send(None, self._device, "release")
-            self._device = None
+        self._teardown_started = True
+        if self._weight_leases:
+            raise Hold("wired_weight_leases_still_active")
+        with _metal_autorelease_pool(self._rt):
+            while self._refs:
+                self._rt.send(None, self._refs[-1], "release")
+                self._refs.pop()
+            self._pipeline = None
+            self._queue = None
+            if self._device:
+                self._rt.send(None, self._device, "release")
+                self._device = None
 
-        dealloc_times: list[int] = []
-        for region in self._regions.values():
+        for name, region in self._regions.items():
+            if name in self._metal_deallocated_ns:
+                continue
             with _METAL_DEALLOC_LOCK:
-                events = _METAL_DEALLOC_EVENTS.pop((region.address, region.mapped_bytes), [])
+                key = (region.address, region.mapped_bytes)
+                events = _METAL_DEALLOC_EVENTS.get(key, [])
+                if len(events) == 1:
+                    _METAL_DEALLOC_EVENTS.pop(key, None)
             if len(events) != 1:
-                raise Hold("metal_deallocator_unconfirmed:" + region.tensor_name)
-            dealloc_times.append(events[0])
+                raise Hold("metal_deallocator_unconfirmed:" + name)
+            self._metal_deallocated_ns[name] = events[0]
 
-        munlock_started_ns = time.monotonic_ns()
-        for region in self._regions.values():
+        if self._munlock_started_ns is None:
+            self._munlock_started_ns = time.monotonic_ns()
+        for name, region in self._regions.items():
+            if name in self._munlocked_regions or name in self._unmapped_regions:
+                continue
             if self._rt.libc.munlock(region.address, region.mapped_bytes) != 0:
-                raise Hold("munlock_failed:" + region.tensor_name)
-        wire_ended_ns = time.monotonic_ns()
-        for region in self._regions.values():
+                raise Hold("munlock_failed:" + name)
+            self._munlocked_regions.add(name)
+        if self._wire_ended_ns is None:
+            self._wire_ended_ns = time.monotonic_ns()
+        for name, region in self._regions.items():
+            if name in self._unmapped_regions:
+                continue
             if self._rt.libc.munmap(region.address, region.mapped_bytes) != 0:
-                raise Hold("munmap_failed:" + region.tensor_name)
+                raise Hold("munmap_failed:" + name)
+            self._unmapped_regions.add(name)
 
         self._retired = True
         self._total_mapped_bytes = 0
+        dealloc_times = list(self._metal_deallocated_ns.values())
         return {
             "regions_released": len(self._regions),
             "wire_completed_ns": self._wire_completed_ns,
             "metal_deallocated_min_ns": min(dealloc_times) if dealloc_times else None,
             "metal_deallocated_max_ns": max(dealloc_times) if dealloc_times else None,
-            "munlock_started_ns": munlock_started_ns,
-            "wire_ended_ns": wire_ended_ns,
+            "munlock_started_ns": self._munlock_started_ns,
+            "wire_ended_ns": self._wire_ended_ns,
             "cleanup_verified": True,
         }
 
+    @_serialized_wired_runner
     def retire_and_unwire(self, readback: DurableRetirement | None) -> dict:
         """Unwire and free Metal/VM mappings ONLY after durable RETIRED readback."""
         if self._retired:
@@ -1104,10 +1243,13 @@ class DarwinWiredWeightRunner:
             raise Hold("wire_epoch_cleanup_order_unconfirmed")
         return audit
 
+    @_serialized_wired_runner
     def emergency_teardown(self) -> dict:
-        """Cleanup for aborted pre-credit setup or test teardown; permanently retires runner."""
+        """Clean up aborted pre-credit setup; never bypass a published epoch."""
         if self._retired:
             return {"regions_released": 0, "cleanup_verified": True, "already_retired": True}
+        if self._active_epoch is not None:
+            raise Hold("emergency_teardown_after_epoch_export_requires_durable_retirement")
         audit = self._release_native_resources()
         audit["emergency_teardown"] = True
         return audit

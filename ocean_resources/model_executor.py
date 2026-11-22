@@ -12,6 +12,7 @@ from pathlib import Path
 
 from .adapters import ComputeExecutorAdapter
 from .contracts import Checkpoint, ExitReadback, Hold, identity, sha256_hex
+from .model_loading import verified_wired_epoch
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,25 @@ class ModelSpec:
         return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+class MLXModelSpec(ModelSpec):
+    """Distinct workload identity for the pinned in-process Qwen runtime."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        from .mlx_qwen import QWEN_MANIFEST_SHA256, QWEN_MODEL
+
+        if (self.model, self.digest) != (QWEN_MODEL, QWEN_MANIFEST_SHA256):
+            raise ValueError("exact reviewed MLX Qwen manifest is required")
+
+    def fingerprint(self):
+        from .mlx_qwen import MLX_LM_VERSION
+        from .mlx_weights import MLX_VERSION
+
+        content = {"schema": "ocean-mlx-text-workload.v1",
+                   "runtime_versions": {"mlx": MLX_VERSION, "mlx-lm": MLX_LM_VERSION}, **asdict(self)}
+        return hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
 class ModelAPIExecutor:
     """Owns only the exact configured model grant; host port owns native locking."""
     def __init__(self, arbiter, spec: ModelSpec, port, state_directory: Path, *, load_policy_sha256=None):
@@ -50,6 +70,10 @@ class ModelAPIExecutor:
         self._pid = os.getpid()
         self._execution = None
         self._absence_verified = False
+
+    @property
+    def requires_staged_load(self):
+        return isinstance(self.spec, MLXModelSpec)
 
     def adapter(self):
         return ComputeExecutorAdapter(self.start, self.checkpoint, self.stop, self.readback,
@@ -67,6 +91,8 @@ class ModelAPIExecutor:
             raise Hold("previous model execution remains unresolved")
         identity(execution_id)
         self.arbiter.require_workload(grant, self.spec.fingerprint(), kind="model-api")
+        if self.requires_staged_load and self.arbiter.load_state(grant) is None:
+            raise Hold("cold in-process MLX requires staged load admission")
         self.port.verify_available(self.spec)
         self._execution = (grant, execution_id)
         self._absence_verified = False
@@ -75,13 +101,16 @@ class ModelAPIExecutor:
         # The normal host inference path performs and supervises any cold load.
         return True
 
-    def _observe_load(self, *, loaded, expected_process=None, accept=None):
+    def _observe_load(self, *, loaded, expected_process=None, accept=None, register_epoch=None):
         if self.load_policy_sha256 is None:
             raise Hold("model cold loading is not configured")
         try:
-            return self.port.load_observation(self.spec, self.load_policy_sha256,
-                loaded=loaded, expected_process=expected_process,
-                capacity_reader=self.arbiter.observe_model_capacity, accept=accept)
+            options = {"expected_process": expected_process,
+                       "capacity_reader": self.arbiter.observe_model_capacity, "accept": accept}
+            observe_wired = getattr(self.port, "load_wired_observation", None) if loaded else None
+            if callable(observe_wired):
+                return observe_wired(self.spec, self.load_policy_sha256, register_epoch=register_epoch, **options)
+            return self.port.load_observation(self.spec, self.load_policy_sha256, loaded=loaded, **options)
         except Hold:
             raise
         except Exception as exc:
@@ -100,6 +129,36 @@ class ModelAPIExecutor:
         observation = self._observe_load(loaded=False)
         return self.arbiter.begin_model_load(grant, self.spec, turn_id, observation)
 
+    @property
+    def supports_materialization(self):
+        return callable(getattr(self.port, "materialize", None))
+
+    def materialize(self, grant, execution_id, permit, *, client_id):
+        self._owned(grant, execution_id)
+        if not self.supports_materialization:
+            raise Hold("native port does not materialize in process")
+        self.port.materialize(self.spec, permit, authority_id=grant.authority_id,
+                              host_id=self.arbiter.authority.host_id, client_id=client_id,
+                              capacity_reader=self.arbiter.observe_model_capacity)
+
+    @property
+    def supports_generation(self):
+        return callable(getattr(self.port, "generate", None))
+
+    def generate(self, grant, execution_id, prompt, max_new_tokens, stop_tokens, check_owned):
+        def ready():
+            check_owned()
+            self._owned(grant, execution_id)
+
+        if not self.supports_generation or len(prompt) + max_new_tokens > self.spec.context_tokens:
+            raise Hold("native generation or its context limit is unavailable")
+        ready()
+        result = self.port.generate(self.spec, prompt, max_new_tokens, ready, stop_tokens=stop_tokens)
+        if (not isinstance(result, tuple) or len(result) > max_new_tokens
+                or any(type(token) is not int or not 0 <= token <= 0x7fffffff for token in result)):
+            raise Hold("native generation returned invalid tokens")
+        return result
+
     def complete_load(self, grant, execution_id, turn_id):
         self._owned(grant, execution_id)
         state = self.arbiter.load_state(grant)
@@ -110,7 +169,12 @@ class ModelAPIExecutor:
                 raise Hold("native load proof cannot be committed twice")
             self.arbiter.complete_model_load(grant, self.spec, turn_id, observation)
             committed = True
-        self._observe_load(loaded=True, expected_process=state["baseline"]["process"], accept=accept)
+        def register_epoch(epoch):
+            self._owned(grant, execution_id)
+            self.arbiter.register_wired_epoch(grant, execution_id, turn_id, epoch)
+
+        self._observe_load(loaded=True, expected_process=state["baseline"]["process"],
+                           accept=accept, register_epoch=register_epoch)
         if not committed:
             raise Hold("native inference owner did not commit the model proof")
 
@@ -131,6 +195,20 @@ class ModelAPIExecutor:
                 accept()
             self._observe_load(loaded=False, expected_process=state["baseline"]["process"],
                                accept=accept_absence)
+        elif state.get("registered_wired_epoch") is not None:
+            abort_wired = getattr(self.port, "abort_wired_load", None)
+            if not callable(abort_wired):
+                raise Hold("native port cannot abort a registered wired epoch")
+
+            def retire_epoch(epoch):
+                self._owned(grant, execution_id)
+                return self.arbiter.retire_wired_epoch(grant, execution_id, epoch, abort_turn=turn_id)
+
+            abort_wired(self.spec, state["baseline"]["process"], retire_epoch)
+            resident = self.port.resident_bytes(self.spec)
+            if type(resident) is not int or resident != 0:
+                raise Hold("wired abort has no zero residency readback")
+            accept()
         else:
             # Strict host gate + exact process + terminal ACK/absence, never the
             # legacy warmup helper. An unknown dispatch keeps this call held.
@@ -174,6 +252,19 @@ class ModelAPIExecutor:
         state = self.arbiter.load_state(grant)
         if state is not None and state["phase"] == "PREPARED":
             self.abort_load(grant, execution_id, "cancelled-before-begin")
+        elif state is not None and state["phase"] == "ABORTED" and state.get("registered_wired_epoch"):
+            # The strict abort already unwired; readback still rechecks absence.
+            return
+        elif verified_wired_epoch(state) is not None:
+            unload = getattr(self.port, "unload_wired", None)
+            if not callable(unload):
+                raise Hold("native port cannot unload an admitted wired epoch")
+
+            def retire_epoch(epoch):
+                self._owned(grant, execution_id, phase="checkpointed")
+                return self.arbiter.retire_wired_epoch(grant, execution_id, epoch)
+
+            unload(self.spec, retire_epoch)
         else:
             self.port.unload(self.spec, lambda: self._owned(grant, execution_id, phase="checkpointed"))
 
