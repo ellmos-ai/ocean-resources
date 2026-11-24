@@ -16,9 +16,8 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-import psutil
-
 from .authority import MAX_JOURNAL_BYTES
+from .capacity import _psutil
 from .contracts import Grant, Hold, RequestLease, ResourceSocket, identity, instant
 from .profiles import ProfileSource, ReviewedProfileGate
 
@@ -26,10 +25,14 @@ from .profiles import ProfileSource, ReviewedProfileGate
 def native_writer_identity(pid):
     if type(pid) is not int or pid <= 0:
         raise Hold("native model writer identity is unavailable")
-    process = psutil.Process(pid)
-    if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
-        raise Hold("native model writer is not alive")
-    return {"pid": pid, "created_at": process.create_time(), "boot_time": psutil.boot_time()}
+    ps = _psutil()
+    try:
+        process = ps.Process(pid)
+        if not process.is_running() or process.status() == ps.STATUS_ZOMBIE:
+            raise Hold("native model writer is not alive")
+        return {"pid": pid, "created_at": process.create_time(), "boot_time": ps.boot_time()}
+    except (ps.Error, OSError) as exc:
+        raise Hold("native model writer is not alive") from exc
 
 
 def _unique(pairs):

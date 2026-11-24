@@ -1,7 +1,7 @@
 # ocean-resources
 
 > Canonical RAM distributor, model runtime scheduler, torch arbiter, and watchdog hysteresis for BACH & Ocean.
-> Last-checked: 2026-11-14 | Version: 0.2.0
+> Last-checked: 2026-11-24 | Version: 0.2.0
 
 ## Overview
 

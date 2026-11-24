@@ -8,7 +8,7 @@ version = "0.2.0"
 description = "Herausgelöstes Ocean-Ressourcenmodul: RAM-Distributor, Modell-Runtime-Arbiter, Fähigkeitsmeldung, Nutzernähe-Klassen und Watchdog-Hysterese (#2441)."
 readme = "README.md"
 license = "MIT"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "THIRD_PARTY_LICENSES.md"]
 requires-python = ">=3.11"
 authors = [{ name = "Lukas Geiger" }]
 dependencies = []
@@ -32,6 +32,7 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: System :: Hardware",
+    "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
@@ -62,7 +63,7 @@ where = ["."]
 include = ["ocean_resources*"]
 
 [tool.setuptools.package-data]
-ocean_resources = ["*.json"]
+ocean_resources = ["*.json", "py.typed"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

@@ -4,8 +4,8 @@
 [![CI](https://github.com/ellmos-ai/ocean-resources/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests: Passing](https://img.shields.io/badge/tests-32%2F32%20passing%20%7C%20100%25%20green-success.svg)](tests/)
-[![Verified: 2026-11-14](https://img.shields.io/badge/verified-2026--11--14-brightgreen.svg)](tests/test_metadata.py)
+[![Tests: Passing](https://img.shields.io/badge/tests-passing%20%7C%20100%25%20green-success.svg)](tests/)
+[![Verified: 2026-11-24](https://img.shields.io/badge/verified-2026--11--24-brightgreen.svg)](tests/test_metadata.py)
 [![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
 > **Languages / Sprachen:** [English](README.md) | [Deutsch](README_de.md)
@@ -45,7 +45,7 @@ Unified arbitration of physical host memory (RAM/VRAM), dynamic model residence,
 |---|---|---|
 | **Stage 1: RAM Distributor (`ram_distributor.py`)** | Single host scheduler for RAM torch, model residence, and compute jobs; consumers declare `ConsumerCapability`; watchdog acts as sensor/actuator with `WatchdogHysteresisPolicy`. | Implemented and verified in `ocean_resources/ram_distributor.py` (`RAMDistributor`, `ConsumerCapability`, `UserProximity`, `DistributorRequest`, `WatchdogHysteresisPolicy`, `FallbackDecision`); bound in `open-ocean` and `bach` via `ocean_stack_bridge.py`. |
 | **Stage 2: Model Runtime & Queue (`inference_queue_policy.py` & `HostInferenceGate`)** | Cross-process, fair admission (`select_next_ticket`, 3:1 foreground fairness) with automated fallback chain (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`). | `select_next_ticket` is a pure selector over a host-supplied snapshot. It owns no queue, process locks, model loading, fallback execution or dispatch. BACH `HostInferenceGate` is an external consumer; its deployment is not verified by this module test suite. |
-| **Run cooldown admission (`RunCooldownGate`, PB-26)** | Before each run of a local large consumer the distributor decides whether it may start; under stress the consumer pauses and resumes after the cooldown. | `RunCooldownGate.check()` with read-only `sample_stress()` (`vm_stat` Swapouts, `kern.memorystatus_vm_pressure_level`, `pmset -g therm`): swap-out rate above 32 MiB/min or pressure above normal -> `cooldown:swap`, thermal warning -> `cooldown:thermal`, under 60 s since the run -> `cooldown:min`. A failed probe drops only its own criterion. Defaults in `RunCooldownPolicy`. |
+| **Run cooldown admission (`RunCooldownGate`)** | Before each run of a local large consumer the distributor decides whether it may start; under stress the consumer pauses and resumes after the cooldown. | `RunCooldownGate.check()` with read-only `sample_stress()` (`vm_stat` Swapouts, `kern.memorystatus_vm_pressure_level`, `pmset -g therm`): swap-out rate above 32 MiB/min or pressure above normal -> `cooldown:swap`, thermal warning -> `cooldown:thermal`, under 60 s since the run -> `cooldown:min`. A failed probe drops only its own criterion. Defaults in `RunCooldownPolicy`. |
 | **Agent-Model Sockets (Decoupled from Slots)** | All agents ("Your Agents") are first-class profiles with direct model bindings (`model` + `model_fallbacks`) and proximity classes 1–4. Legacy `slots` keys in `slots_config.json` remain only for backward storage compatibility. | `model_sockets.py` (`bach.model-sockets.v1`) manages bindings; tray (`ellmos-tray`) and web GUI (`/agenten/running`) expose real-time model bindings and RAM claims. |
 
 ---
@@ -232,11 +232,12 @@ sequenceDiagram
 - **INV-LOCAL-01 (Zero Egress):** Pure local resource arbitration with zero external network dependencies or telemetry calls.
 - **INV-LOCAL-02 (Deterministic Turn Scheduling):** When both priorities have valid live tickets, the host preserves `next_foreground_streak`, and `legacy_foreground_pending` is false, the selector chooses a background ticket after at most three consecutive foreground selections. A legacy foreground hold returns no ticket. This is not a wall-clock or end-to-end starvation guarantee.
 - **INV-LOCAL-03 (Non-Privileged Execution):** Zero root or administrator privileges required; operates entirely in regular user space.
-- **Level 1 SBOM:**
-  - `setuptools >= 68.0` (Build system)
-  - `pytest` (Test runner)
-  - Python Standard Library (`dataclasses`, `typing`, `pathlib`, `json`, `os`, `sys`)
-  - License: MIT (SPDX compliant)
+- **Level 1 SBOM ([THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)):**
+  - **Runtime (`dependencies = []`):** `0` external runtime dependencies — Python `>= 3.11` Standard Library (`PSF-2.0`)
+  - **Optional Native Extra (`ocean-resources[native]`):** `psutil >= 5.9.6, < 8` (`BSD-3-Clause`)
+  - **Optional Apple Silicon MLX Source Extension (`native/mlx`):** `mlx == 0.32.0` (`MIT`), `mlx-lm == 0.31.3` (`MIT`), `numpy` (`BSD-3-Clause`), `nanobind == 2.13.0` (`BSD-3-Clause`)
+  - **Build & Dev Tooling:** `setuptools >= 77.0.3` (`MIT`), `build` (`MIT`), `pytest >= 8.0` (`MIT`), `ruff >= 0.4` (`MIT`)
+  - **License:** MIT (`SPDX-License-Identifier: MIT`)
 
 ---
 
@@ -244,7 +245,7 @@ sequenceDiagram
 ## 07. Installation & Test Execution
 
 ```bash
-# 1. Clone the repository (Plan D canonical clone)
+# 1. Clone the repository
 git clone https://github.com/ellmos-ai/ocean-resources.git
 cd ocean-resources
 
@@ -273,7 +274,7 @@ Install and verify https://github.com/ellmos-ai/ocean-resources (prefer a releas
 <a id="sec-08"></a>
 ## 08. Governance & Contributing
 
-Contributions and issue reports are welcome. Please refer to our [Contributing Guide](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), and [Security Policy](SECURITY.md).
+Contributions and issue reports are welcome. Please refer to our [Contributing Guide](CONTRIBUTING.md), [Code of Conduct](CODE_OF_CONDUCT.md), [Security Policy](SECURITY.md), and [Third-Party Licenses / SBOM](THIRD_PARTY_LICENSES.md).
 
 ## Cooperative host service
 

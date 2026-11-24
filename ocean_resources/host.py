@@ -105,12 +105,26 @@ def parse_macos_vm(text: str) -> int:
 
 @dataclass(frozen=True)
 class StressSample:
-    """Read-only stress signals for run admission (PB-26); None means not measured."""
+    """Read-only stress signals for run admission; None means not measured."""
 
     observed_at: float  # time.monotonic() of this host; only used for rates between two samples
     swapouts_bytes: int | None = None  # cumulative vm_stat "Swapouts" x page size (SSD writes)
     pressure_level: int | None = None  # kern.memorystatus_vm_pressure_level: 1 normal, 2 warn, 4 critical
     thermal_warning: bool | None = None  # pmset -g therm
+
+    def __post_init__(self) -> None:
+        if not instant(self.observed_at):
+            raise ValueError("finite nonnegative monotonic observation time required")
+        if self.swapouts_bytes is not None and (
+            type(self.swapouts_bytes) is not int or self.swapouts_bytes < 0
+        ):
+            raise ValueError("swapouts_bytes must be a nonnegative integer or None")
+        if self.pressure_level is not None and (
+            type(self.pressure_level) is not int or self.pressure_level not in {1, 2, 4}
+        ):
+            raise ValueError("pressure_level must be 1, 2, 4 or None")
+        if self.thermal_warning is not None and type(self.thermal_warning) is not bool:
+            raise ValueError("thermal_warning must be a bool or None")
 
 
 def parse_swapouts(text: str) -> int:

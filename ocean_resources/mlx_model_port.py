@@ -5,7 +5,7 @@ import os
 from threading import Lock
 import time
 
-from .capacity import DarwinVmStatSample
+from .capacity import DarwinVmStatSample, _psutil
 from .contracts import Grant, Hold, positive, sha256_hex
 from .mlx_qwen import QwenTextPlan
 from .mlx_qwen_runtime import QwenTextRuntime
@@ -32,12 +32,11 @@ class InProcessQwenPort:
                 or not positive(headroom_bytes) or headroom_bytes < GIB + GIB // 2):
             raise ValueError("Qwen port requires the exact plan and reviewed headroom")
         sha256_hex(policy_sha256)
-        import psutil
 
         self._spec, self._plan = spec, plan
         self._policy = policy_sha256
         self._headroom = headroom_bytes
-        self._psutil = psutil
+        self._psutil = _psutil()
         self._pid = os.getpid()
         self._lock = Lock()
         self._runner = self._runtime = self._scope = self._epoch = None
@@ -48,8 +47,11 @@ class InProcessQwenPort:
             raise Hold("foreign in-process Qwen model or process")
 
     def _identity(self):
-        process = self._psutil.Process(self._pid)
-        return ProcessIdentity(process.pid, process.create_time(), self._psutil.boot_time()), process
+        try:
+            process = self._psutil.Process(self._pid)
+            return ProcessIdentity(process.pid, process.create_time(), self._psutil.boot_time()), process
+        except (self._psutil.Error, OSError, ValueError) as exc:
+            raise Hold("in-process Qwen model process identity unavailable") from exc
 
     def _expect_process(self, expected):
         identity, _ = self._identity()
