@@ -3,7 +3,7 @@ name: ocean-resources
 version: "0.2.0"
 type: standalone-module
 standalone: true
-visibility: private
+visibility: public
 provenance: "Extrahiert aus Ocean / BACH Ressourcenarchitektur (#2441)"
 description: "Offline-first RAM distributor and model runtime scheduler for cooperative local LLM inference and compute job arbitration."
 ---

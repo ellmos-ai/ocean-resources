@@ -1,6 +1,12 @@
-# Python & Build Artifacts
+# Python, Native & Build Artifacts
 __pycache__/
 *.py[cod]
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dylib
+*.dll
 *$py.class
 *.egg-info/
 .eggs/
@@ -14,6 +20,8 @@ ENV/
 
 # Testing, Coverage & Tool Caches
 .pytest_cache/
+.pytest_temp/
+.pytest_tmp/
 .ruff_cache/
 .mypy_cache/
 .coverage
@@ -21,15 +29,75 @@ ENV/
 htmlcov/
 *.prof
 
-# Internal Agent / Bot Logs & Lock Defense
+# IDEs & OS Metadata
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Secrets, Credentials, Keys & Environment Files
+.env
+.env.local
+.env.*
+!.env.example
+.npmrc
+.pypirc
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cert
+*.csr
+*.token
+*.secret
+credentials.json
+secrets.json
+token.json
+tokens.json
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+id_ecdsa
+id_ecdsa.*
+id_dsa
+id_dsa.*
+*recovery*code*.txt
+
+# Pre-Push Data-Gate & Local Runtime State Defense
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite*
+*.bachdb
+*.bachdb*
+data/
+data/temp/
+data/temp/**
+*export*.csv
+*dump*
+inbox_config*
+TO-DECIDE-USER*
+
+# Internal Agent / Bot Logs, Locks & Multi-Host Sync Conflict Defense
 *MARKETING-LOG.txt
 *STATUS-LOG.txt
+*CHECKS-LOG.txt
+*ANTIGRAVITY-LOG.txt
 LOCK.txt
 LOCK.*.txt
 LOCK-CACHE.*
 LOCK.permissions.*
 TEST.txt
 TESTS.txt
+*.sync-conflict-*
+*sync-conflict*
+CONFLICT_REVIEW_LOG*
 .claude/
 .gemini/
 .cursor/

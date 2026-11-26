@@ -4,8 +4,8 @@
 [![CI](https://github.com/ellmos-ai/ocean-resources/actions/workflows/ci.yml/badge.svg)](.github/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
-[![Tests: Passing](https://img.shields.io/badge/tests-32%2F32%20passing%20%7C%20100%25%20green-success.svg)](tests/)
-[![Verified: 2026-11-14](https://img.shields.io/badge/verified-2026--11--14-brightgreen.svg)](tests/test_metadata.py)
+[![Tests: Passing](https://img.shields.io/badge/tests-passing%20%7C%20100%25%20green-success.svg)](tests/)
+[![Verified: 2026-11-24](https://img.shields.io/badge/verified-2026--11--24-brightgreen.svg)](tests/test_metadata.py)
 [![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
 > **Sprachen / Languages:** [Deutsch](README_de.md) | [English](README.md)
@@ -45,7 +45,7 @@ Einheitliche Koordination von physischem Host-Arbeitsspeicher (RAM/VRAM), dynami
 |---|---|---|
 | **Stufe 1: RAM-Distributor (`ram_distributor.py`)** | Einziger Host-Scheduler für RAM-Fackel, Modell-Residenz und Compute-Jobs; Verbraucher melden `ConsumerCapability`; Watchdog ist reiner Sensor/Aktor mit `WatchdogHysteresisPolicy`. | Implementiert & getestet in `ocean_resources/ram_distributor.py` (`RAMDistributor`, `ConsumerCapability`, `UserProximity`, `DistributorRequest`, `WatchdogHysteresisPolicy`, `FallbackDecision`); über `ocean_stack_bridge.py` in `open-ocean` und `bach` gebunden (`bound: true`). |
 | **Stufe 2: Modell-Runtime & Queue (`inference_queue_policy.py` & `HostInferenceGate`)** | Prozessübergreifende, faire Zulassung (`select_next_ticket`, 3:1 Foreground-Fairness) + automatische Fallback-Kette (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`). | `select_next_ticket` ist eine reine Auswahlfunktion über einen vom Host gelieferten Schnappschuss. Sie besitzt keine Queue, Prozesslocks, Modelllade-, Fallback- oder Dispatch-Ausführung. BACH `HostInferenceGate` ist ein externer Verbraucher; seine Auslieferung wird durch diese Modultests nicht belegt. |
-| **Abkühlzulassung vor jedem Lauf (`RunCooldownGate`, PB-26)** | Vor jedem Lauf eines lokalen Großverbrauchers entscheidet der Verteiler, ob er starten darf; unter Last pausiert der Verbraucher und fährt nach der Abkühlung wieder an. | `RunCooldownGate.check()` mit nur lesendem `sample_stress()` (`vm_stat`-Swapouts, `kern.memorystatus_vm_pressure_level`, `pmset -g therm`): Swap-Schreibrate über 32 MiB/min oder Druck über normal -> `cooldown:swap`, Wärmewarnung -> `cooldown:thermal`, weniger als 60 s seit dem Lauf -> `cooldown:min`. Fällt eine Messung aus, entfällt nur ihr Kriterium. Standardwerte in `RunCooldownPolicy`. |
+| **Abkühlzulassung vor jedem Lauf (`RunCooldownGate`)** | Vor jedem Lauf eines lokalen Großverbrauchers entscheidet der Verteiler, ob er starten darf; unter Last pausiert der Verbraucher und fährt nach der Abkühlung wieder an. | `RunCooldownGate.check()` mit nur lesendem `sample_stress()` (`vm_stat`-Swapouts, `kern.memorystatus_vm_pressure_level`, `pmset -g therm`): Swap-Schreibrate über 32 MiB/min oder Druck über normal -> `cooldown:swap`, Wärmewarnung -> `cooldown:thermal`, weniger als 60 s seit dem Lauf -> `cooldown:min`. Fällt eine Messung aus, entfällt nur ihr Kriterium. Standardwerte in `RunCooldownPolicy`. |
 | **Agenten-Modell-Bindung (statt alter Slots)** | Alle Agenten („Deine Agenten") sind gleichberechtigte Profile mit Modellbindung (`model` + `model_fallbacks`) und Nutzernähe-Klasse 1–4. Historischer Schlüssel `slots` in `slots_config.json` dient nur der Speicher-Abwärtskompatibilität. | `model_sockets.py` (`bach.model-sockets.v1`) projiziert und verwaltet Agenten-Modell-Bindungen; Tray (`ellmos-tray`) und GUI (`/agenten/running`) zeigen **„🤖 Deine Agenten (Modell-Bindung)"** und **„🔥 RAM-Distributor & Modell-Claim"**. |
 
 ---
@@ -232,11 +232,12 @@ sequenceDiagram
 - **INV-LOCAL-01 (Zero Egress):** Reines lokales Scheduling ohne externe Netzwerk-Egress-Abhängigkeiten.
 - **INV-LOCAL-02 (Deterministische Queue-Auswahl):** Wenn beide Prioritäten gültige lebende Tickets haben, der Host `next_foreground_streak` fortschreibt und `legacy_foreground_pending` falsch ist, wählt die Funktion nach höchstens drei aufeinanderfolgenden Vordergrundauswahlen ein Hintergrundticket. Bei gesetzter Legacy-Vordergrundsperre wird kein Ticket gewählt. Das ist keine zeitliche oder durchgängige Starvation-Garantie.
 - **INV-LOCAL-03 (Unprivilegierte Ausführung):** Keine Administrator- oder Root-Rechte erforderlich; Ausführung erfolgt im unprivilegierten Benutzerkontext.
-- **Level 1 SBOM:**
-  - `setuptools >= 68.0` (Build-System)
-  - `pytest` (Test-Laufzeit)
-  - Python Standard Library (`dataclasses`, `typing`, `pathlib`, `json`, `os`, `sys`)
-  - Lizenz: MIT (SPDX-konform)
+- **Level 1 SBOM ([THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)):**
+  - **Laufzeit (`dependencies = []`):** `0` externe Pflichtabhängigkeiten — Python `>= 3.11` Standardbibliothek (`PSF-2.0`)
+  - **Optionales Native-Extra (`ocean-resources[native]`):** `psutil >= 5.9.6, < 8` (`BSD-3-Clause`)
+  - **Optionale Apple-Silicon-MLX-Quellerweiterung (`native/mlx`):** `mlx == 0.32.0` (`MIT`), `mlx-lm == 0.31.3` (`MIT`), `numpy` (`BSD-3-Clause`), `nanobind == 2.13.0` (`BSD-3-Clause`)
+  - **Build- & Entwicklungswerkzeuge:** `setuptools >= 77.0.3` (`MIT`), `build` (`MIT`), `pytest >= 8.0` (`MIT`), `ruff >= 0.4` (`MIT`)
+  - **Lizenz:** MIT (`SPDX-License-Identifier: MIT`)
 
 ---
 
@@ -244,7 +245,7 @@ sequenceDiagram
 ## 07. Installation & Testausführung
 
 ```bash
-# 1. Repository klonen (Plan D kanonischer Klon)
+# 1. Repository klonen
 git clone https://github.com/ellmos-ai/ocean-resources.git
 cd ocean-resources
 
@@ -273,4 +274,4 @@ Installiere und verifiziere https://github.com/ellmos-ai/ocean-resources (Releas
 <a id="sec-08"></a>
 ## 08. Governance & Mitwirken
 
-Beiträge und Fehlerberichte sind herzlich willkommen. Bitte beachten Sie unsere [Beitragsrichtlinie](CONTRIBUTING.md), den [Verhaltenskodex](CODE_OF_CONDUCT.md) sowie die [Sicherheitsrichtlinie](SECURITY.md).
+Beiträge und Fehlerberichte sind herzlich willkommen. Bitte beachten Sie unsere [Beitragsrichtlinie](CONTRIBUTING.md), den [Verhaltenskodex](CODE_OF_CONDUCT.md), die [Sicherheitsrichtlinie](SECURITY.md) sowie die [Drittanbieter-Lizenzen / SBOM](THIRD_PARTY_LICENSES.md).

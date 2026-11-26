@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security & Supply-Chain Hardening (2026-11-24)
+- **Fail-Closed Numeric, Temporal & Type Validation (`CWE-20` / `CWE-704`):** Hardened `StressSample`, `RunCooldownPolicy`, `CooldownDecision`, `FallbackDecision`, `swapout_mib_per_minute`, `RunCooldownGate.check`, `ConsumerCapability`, `DistributorRequest`, `WatchdogHysteresisPolicy`, and `RAMDistributor.evaluate` to reject `NaN`, `±Inf`, negative values, backward sample timestamps, sub-second baseline sliding under active swap, `bool`-as-`int` confusion, non-boolean truthy flags, single-pass iterator exhaustion, and unknown pressure states before mutating state or admitting workloads.
+- **Zero-Dependency & Version-Pin Contract:** Replaced unconditional module-level `psutil` import in `ocean_resources/model_dispatch.py` and unpinned import in `ocean_resources/mlx_model_port.py` with `capacity._psutil()` (`5.9.6 <= psutil < 8`), preserving stdlib-only imports when `ocean-resources[native]` is not installed and failing closed with `Hold` on dead/zombie processes or unapproved `psutil` versions.
+- **SBOM, Security SLAs, CI Build Gate & Packaging Completeness:** Added `THIRD_PARTY_LICENSES.md` (Level-1 SBOM including optional MLX/`numpy`/`nanobind` and CI `build` pins), `TODO.md` (10-gate release readiness table), PEP 561 `ocean_resources/py.typed` marker, binding `INV-SLA-09` / `INV-SLA-10` response targets in `SECURITY.md` (`48h` / `5d` / `30d`), stdlib-only import + `sdist`/`wheel` verification in `.github/workflows/ci.yml`, enabled weekly Dependabot `pip` PRs (`open-pull-requests-limit: 5`), aligned `SKILL.md` visibility (`public`), and cleaned internal workstation path/tag references from `CONTRIBUTING.md` and `README*.md`.
+- **Pre-Push Data-Gate & `.gitignore` Defense:** Expanded `.gitignore` with database/SQLite/WAL, CSV export/dump, `inbox_config*`, `TO-DECIDE-USER*`, `data/temp/**`, TLS/SSH key/token, and multi-host sync-conflict exclusions (version `0.2.0` preserved).
+
 ### Added (2026-11-14, Path A Hygiene)
 - Cross-platform CI workflow (`.github/workflows/ci.yml`) testing Python 3.11–3.13 across `ubuntu-latest`, `windows-latest`, and `macos-latest` with whitespace, `ruff`, `compileall`, CLI resource smoke checks, and `pytest` gates.
 - GitHub community & dependency governance: `.github/dependabot.yml` (`github-actions` + security `pip`) and bilingual `.github/ISSUE_TEMPLATE/` (`bug_report.md`, `feature_request.md`).
@@ -15,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Expanded metadata contract tests in `tests/test_metadata.py` (CI matrix, Dependabot, Issue templates, `.gitignore` lock defense, LLM install guidance, and packaged JSON resource smoke checks).
 - Bilingual LLM installation prompt section (`Install with your LLM` / `Mit deinem LLM installieren`) in `README.md` and `README_de.md`, machine-readable install/verification commands in `llms.txt`, and updated test/verification badges (version `0.2.0` preserved per freeze).
 
-### Added (2026-11-08, PB-26)
+### Added (2026-11-08, Run Cooldown Admission)
 - `RunCooldownGate`, `RunCooldownPolicy` and `CooldownDecision` in `ram_distributor.py`: admission before each run of a local large consumer with the reasons `cooldown:swap` (swap-out rate above 32 MiB/min or memory pressure above normal), `cooldown:thermal` (`pmset -g therm` warning) and `cooldown:min` (60 s minimum pause). A failed probe drops only its own criterion, so unknown swap never blocks permanently.
 - `StressSample` and read-only `sample_stress()` in `host.py` (`vm_stat` Swapouts, `sysctl kern.memorystatus_vm_pressure_level`, `pmset -g therm`; no sudo, no writes).
 
@@ -35,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pytest runtime configuration in `pyproject.toml` (`pythonpath = ["."]`).
 
 ### Changed
-- `pyproject.toml` expanded with discoverability metadata while preserving version freeze at `0.2.0` (T-20260920-167562623).
+- `pyproject.toml` expanded with discoverability metadata while preserving version freeze at `0.2.0`.
 
 ## [0.2.0] - 2026-11-03
 

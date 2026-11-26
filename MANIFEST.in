@@ -1,7 +1,9 @@
 include LICENSE
+include THIRD_PARTY_LICENSES.md
 include README.md
 include README_de.md
 include CHANGELOG.md
+include TODO.md
 include CODE_OF_CONDUCT.md
 include CONTRIBUTING.md
 include SECURITY.md
@@ -10,4 +12,5 @@ include llms.txt
 include llm.txt
 include ellmos-module.v2.json
 include ocean_resources/*.json
+include ocean_resources/py.typed
 global-exclude __pycache__ *.py[cod] .pytest_cache/* .ruff_cache/*
