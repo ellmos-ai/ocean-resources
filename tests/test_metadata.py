@@ -268,3 +268,16 @@ def test_packaged_json_resources_and_cli_smoke():
 
     assert main(["manifest"]) == 0
     assert main(["catalog"]) == 0
+
+
+def test_module_manifest_declares_docs_languages_and_ui_surface():
+    mod_meta = json.loads((REPO_ROOT / "ellmos-module.v2.json").read_text(encoding="utf-8"))
+    assert mod_meta.get("languages") == ["de", "en"]
+    docs = mod_meta.get("docs")
+    assert isinstance(docs, dict)
+    for key in ("entry", "readme", "doc_de", "skill_entry", "changelog"):
+        rel = docs.get(key)
+        assert isinstance(rel, str) and (REPO_ROOT / rel).is_file(), f"docs.{key} must point to an existing file"
+    assert docs.get("languages") == ["de", "en"]
+    ui = mod_meta.get("ui")
+    assert ui == {"agent_only": True, "surfaces": []}
