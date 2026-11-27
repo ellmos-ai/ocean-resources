@@ -17,7 +17,8 @@
     "control.resources.model-scheduler",
     "control.resources.torch-arbiter",
     "control.resources.watchdog-hysteresis",
-    "control.resources.inference-queue-policy"
+    "control.resources.inference-queue-policy",
+    "control.resources.model-tuning-catalog"
   ],
   "requires": [],
   "optional": [],

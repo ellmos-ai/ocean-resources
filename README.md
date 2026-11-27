@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![Tests: Passing](https://img.shields.io/badge/tests-passing%20%7C%20100%25%20green-success.svg)](tests/)
-[![Verified: 2026-11-24](https://img.shields.io/badge/verified-2026--11--24-brightgreen.svg)](tests/test_metadata.py)
+[![Verified: 2026-11-27](https://img.shields.io/badge/verified-2026--11--27-brightgreen.svg)](tests/test_metadata.py)
 [![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
 > **Languages / Sprachen:** [English](README.md) | [Deutsch](README_de.md)
@@ -39,7 +39,7 @@ Unified arbitration of physical host memory (RAM/VRAM), dynamic model residence,
 ---
 
 <a id="sec-02"></a>
-## 02. Target Architecture vs. Implementation State (As of 2026-11-14)
+## 02. Target Architecture vs. Implementation State (As of 2026-11-27)
 
 | Domain | Target Architecture | Implementation State |
 |---|---|---|
@@ -47,6 +47,7 @@ Unified arbitration of physical host memory (RAM/VRAM), dynamic model residence,
 | **Stage 2: Model Runtime & Queue (`inference_queue_policy.py` & `HostInferenceGate`)** | Cross-process, fair admission (`select_next_ticket`, 3:1 foreground fairness) with automated fallback chain (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`). | `select_next_ticket` is a pure selector over a host-supplied snapshot. It owns no queue, process locks, model loading, fallback execution or dispatch. BACH `HostInferenceGate` is an external consumer; its deployment is not verified by this module test suite. |
 | **Run cooldown admission (`RunCooldownGate`)** | Before each run of a local large consumer the distributor decides whether it may start; under stress the consumer pauses and resumes after the cooldown. | `RunCooldownGate.check()` with read-only `sample_stress()` (`vm_stat` Swapouts, `kern.memorystatus_vm_pressure_level`, `pmset -g therm`): swap-out rate above 32 MiB/min or pressure above normal -> `cooldown:swap`, thermal warning -> `cooldown:thermal`, under 60 s since the run -> `cooldown:min`. A failed probe drops only its own criterion. Defaults in `RunCooldownPolicy`. |
 | **Agent-Model Sockets (Decoupled from Slots)** | All agents ("Your Agents") are first-class profiles with direct model bindings (`model` + `model_fallbacks`) and proximity classes 1–4. Legacy `slots` keys in `slots_config.json` remain only for backward storage compatibility. | `model_sockets.py` (`bach.model-sockets.v1`) manages bindings; tray (`ellmos-tray`) and web GUI (`/agenten/running`) expose real-time model bindings and RAM claims. |
+| **Hardware- & RAM-Coupled Model Tuning (`model_tuning_catalog.py`)** | Zero-config safe context window (`num_ctx`), KV-cache quantization, flash-attention, and Clutch gear defaults coupled to physical host RAM (`ocean.model-tuning-catalog.v1`). | Implemented and verified in `ocean_resources/model_tuning_catalog.py` (`load_model_tuning_catalog`, `resolve_model_tuning`, `detect_host_ram_gib`, `export_clutch_local_gears`) with deterministic precedence `slot_override > model_config > catalog_default > env_fallback > safe_baseline`. |
 
 ---
 

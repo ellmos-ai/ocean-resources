@@ -89,14 +89,28 @@ TO-DECIDE-USER*
 *STATUS-LOG.txt
 *CHECKS-LOG.txt
 *ANTIGRAVITY-LOG.txt
+LOCK
 LOCK.txt
 LOCK.*.txt
+LOCK*.txt
+*.lock
 LOCK-CACHE.*
 LOCK.permissions.*
 TEST.txt
 TESTS.txt
 *.sync-conflict-*
 *sync-conflict*
+* (Konfliktkopie)*
+* (conflicted copy)*
+* (Kopie)*
+* (Copy)*
+* (kopie)*
+* (copy)*
+*-WORKSTATION*
+*-ASUS*
+*-LAPTOP*
+*-DESKTOP*
+*-Mac Studio*
 CONFLICT_REVIEW_LOG*
 .claude/
 .gemini/

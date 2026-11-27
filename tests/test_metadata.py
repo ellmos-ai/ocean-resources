@@ -47,7 +47,7 @@ def test_version_freeze_and_pep639():
 
     package_data = data.get("tool", {}).get("setuptools", {}).get("package-data", {})
     pkg_files = package_data.get("ocean_resources", [])
-    for name in ("manifest.json", "pipeline-catalog.json", "py.typed"):
+    for name in ("manifest.json", "pipeline-catalog.json", "model-tuning-catalog.v1.json", "py.typed"):
         assert any(fnmatchcase(name, pattern) for pattern in pkg_files), f"{name} must be covered by package-data"
 
     pytest_cfg = data.get("tool", {}).get("pytest", {}).get("ini_options", {})
@@ -175,6 +175,7 @@ def test_security_policy_slas_and_sbom_parity():
     mod_meta = json.loads((REPO_ROOT / "ellmos-module.v2.json").read_text(encoding="utf-8"))
     skill_text = (REPO_ROOT / "SKILL.md").read_text(encoding="utf-8")
     assert mod_meta.get("visibility") == "public"
+    assert "control.resources.model-tuning-catalog" in mod_meta.get("provides", [])
     assert "visibility: public" in skill_text
 
 
@@ -201,6 +202,9 @@ def test_gitignore_lock_and_data_gate_defense():
         ".vscode/",
         "LOCK.txt",
         "LOCK.*.txt",
+        "LOCK*.txt",
+        "* (Konfliktkopie)*",
+        "* (conflicted copy)*",
         "LOCK-CACHE.*",
         "*MARKETING-LOG.txt",
         "*.sync-conflict-*",
@@ -259,10 +263,19 @@ def test_packaged_json_resources_and_cli_smoke():
     pkg = files("ocean_resources")
     manifest_data = json.loads(pkg.joinpath("manifest.json").read_text(encoding="utf-8"))
     catalog_data = json.loads(pkg.joinpath("pipeline-catalog.json").read_text(encoding="utf-8"))
+    tuning_data = json.loads(pkg.joinpath("model-tuning-catalog.v1.json").read_text(encoding="utf-8"))
     assert pkg.joinpath("py.typed").is_file(), "py.typed must be accessible via importlib.resources"
 
     assert manifest_data.get("schema") == "ellmos.ocean-resource-seam.v1"
     assert catalog_data.get("schema") == "ocean-pipeline-catalog.v1"
+    assert tuning_data.get("schema") == "ocean.model-tuning-catalog.v1"
+
+    from ocean_resources.model_tuning_catalog import load_model_tuning_catalog, resolve_model_tuning
+
+    loaded_tuning = load_model_tuning_catalog()
+    assert loaded_tuning.get("schema") == "ocean.model-tuning-catalog.v1"
+    resolved = resolve_model_tuning("qwen3:8b", host_ram_gib=32.0, catalog=loaded_tuning)
+    assert resolved.supported_on_host is True and resolved.num_ctx >= 512
 
     from ocean_resources.__main__ import main
 
