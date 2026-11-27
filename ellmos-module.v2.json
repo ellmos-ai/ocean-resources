@@ -26,6 +26,25 @@
     "library",
     "cli"
   ],
+  "languages": [
+    "de",
+    "en"
+  ],
+  "docs": {
+    "entry": "README.md",
+    "readme": "README.md",
+    "doc_de": "README_de.md",
+    "skill_entry": "SKILL.md",
+    "changelog": "CHANGELOG.md",
+    "languages": [
+      "de",
+      "en"
+    ]
+  },
+  "ui": {
+    "agent_only": true,
+    "surfaces": []
+  },
   "state": {
     "ownership": "module",
     "location": "user-home"
