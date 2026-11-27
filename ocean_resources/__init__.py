@@ -54,6 +54,15 @@ from .inference_queue_policy import (
     SelectionReason,
     select_next_ticket,
 )
+from .model_tuning_catalog import (
+    CATALOG_SCHEMA,
+    DEFAULT_CATALOG_PATH,
+    ResolvedModelTuning,
+    detect_host_ram_gib,
+    export_clutch_local_gears,
+    load_model_tuning_catalog,
+    resolve_model_tuning,
+)
 
 __all__ = [
     "BACHFacade", "CapacityReadback", "Checkpoint", "ComputeExecutorAdapter",
@@ -76,4 +85,7 @@ __all__ = [
     "parse_safetensors_header", "permit_unwire",
     "MAX_CONSECUTIVE_FOREGROUND", "QueuePolicyError", "QueuePriority",
     "QueueSelection", "QueueTicket", "SelectionReason", "select_next_ticket",
+    "CATALOG_SCHEMA", "DEFAULT_CATALOG_PATH", "ResolvedModelTuning",
+    "detect_host_ram_gib", "export_clutch_local_gears",
+    "load_model_tuning_catalog", "resolve_model_tuning",
 ]
