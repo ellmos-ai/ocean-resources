@@ -2,7 +2,6 @@
   "schema": "ocean.model-tuning-catalog.v1",
   "schema_version": 1,
   "updated_at": "2026-11-27",
-  "reference_ticket": "T-20261127-012700001",
   "reference_bach_task": 4445,
   "default_fallback": {
     "num_ctx_safe": 4096,
@@ -32,7 +31,7 @@
       "clutch_leistung": "hoch",
       "measurement_evidence": {
         "date": "2026-11-27",
-        "host": "mac-studio",
+        "host_class": "apple-silicon-32gb",
         "hardware": "Apple M1 Max 32 GiB Unified Memory (Metal recommendedMaxWorkingSetSize 24.96 GiB)",
         "runtime": "Ollama 0.40.17 MLX",
         "summary": "16384 ctx + 40 tool rounds verified stable for 5+ hours without OOM; 24576 cold-loads cleanly (26.56s) but hits reproducible Metal OOM (kIOGPUCommandBufferCallbackErrorOutOfMemory) under multi-turn KV-cache load at tool 5-8 -> 24k+ gated to >=48 GiB."
@@ -126,10 +125,10 @@
       "clutch_leistung": "hoch",
       "measurement_evidence": {
         "date": "2026-11-26",
-        "host": "mac-studio",
+        "host_class": "apple-silicon-32gb",
         "hardware": "Apple M1 Max 32 GiB Unified Memory",
         "runtime": "Ollama MLX",
-        "summary": "Historically operated on mac-studio with 16384 ctx and 25 tool rounds."
+        "summary": "Historically operated on 32 GiB Apple Silicon with 16384 ctx and 25 tool rounds."
       },
       "ram_tiers": [
         {
