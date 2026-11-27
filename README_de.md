@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Python: 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](pyproject.toml)
 [![Tests: Passing](https://img.shields.io/badge/tests-passing%20%7C%20100%25%20green-success.svg)](tests/)
-[![Verified: 2026-11-24](https://img.shields.io/badge/verified-2026--11--24-brightgreen.svg)](tests/test_metadata.py)
+[![Verified: 2026-11-27](https://img.shields.io/badge/verified-2026--11--27-brightgreen.svg)](tests/test_metadata.py)
 [![LLM Ready: llms.txt](https://img.shields.io/badge/llm-ready-informational.svg)](llms.txt)
 
 > **Sprachen / Languages:** [Deutsch](README_de.md) | [English](README.md)
@@ -39,7 +39,7 @@ Einheitliche Koordination von physischem Host-Arbeitsspeicher (RAM/VRAM), dynami
 ---
 
 <a id="sec-02"></a>
-## 02. SOLL-Stand vs. IST-Stand (Stand 14.11.2026)
+## 02. SOLL-Stand vs. IST-Stand (Stand 27.11.2026)
 
 | Bereich | SOLL-Stand (Zielarchitektur) | Belegter IST-Stand |
 |---|---|---|
@@ -47,6 +47,7 @@ Einheitliche Koordination von physischem Host-Arbeitsspeicher (RAM/VRAM), dynami
 | **Stufe 2: Modell-Runtime & Queue (`inference_queue_policy.py` & `HostInferenceGate`)** | Prozessübergreifende, faire Zulassung (`select_next_ticket`, 3:1 Foreground-Fairness) + automatische Fallback-Kette (`cloud_router`, `smaller_local_model`, `defer_with_checkpoint`). | `select_next_ticket` ist eine reine Auswahlfunktion über einen vom Host gelieferten Schnappschuss. Sie besitzt keine Queue, Prozesslocks, Modelllade-, Fallback- oder Dispatch-Ausführung. BACH `HostInferenceGate` ist ein externer Verbraucher; seine Auslieferung wird durch diese Modultests nicht belegt. |
 | **Abkühlzulassung vor jedem Lauf (`RunCooldownGate`)** | Vor jedem Lauf eines lokalen Großverbrauchers entscheidet der Verteiler, ob er starten darf; unter Last pausiert der Verbraucher und fährt nach der Abkühlung wieder an. | `RunCooldownGate.check()` mit nur lesendem `sample_stress()` (`vm_stat`-Swapouts, `kern.memorystatus_vm_pressure_level`, `pmset -g therm`): Swap-Schreibrate über 32 MiB/min oder Druck über normal -> `cooldown:swap`, Wärmewarnung -> `cooldown:thermal`, weniger als 60 s seit dem Lauf -> `cooldown:min`. Fällt eine Messung aus, entfällt nur ihr Kriterium. Standardwerte in `RunCooldownPolicy`. |
 | **Agenten-Modell-Bindung (statt alter Slots)** | Alle Agenten („Deine Agenten") sind gleichberechtigte Profile mit Modellbindung (`model` + `model_fallbacks`) und Nutzernähe-Klasse 1–4. Historischer Schlüssel `slots` in `slots_config.json` dient nur der Speicher-Abwärtskompatibilität. | `model_sockets.py` (`bach.model-sockets.v1`) projiziert und verwaltet Agenten-Modell-Bindungen; Tray (`ellmos-tray`) und GUI (`/agenten/running`) zeigen **„🤖 Deine Agenten (Modell-Bindung)"** und **„🔥 RAM-Distributor & Modell-Claim"**. |
+| **Hardware- & RAM-gekoppeltes Modell-Tuning (`model_tuning_catalog.py`)** | Konfigurationsfreie Sicherheits-Defaults für Kontextfenster (`num_ctx`), KV-Cache-Quantisierung, Flash-Attention und Clutch-Gänge gekoppelt an den physischen Host-RAM (`ocean.model-tuning-catalog.v1`). | Implementiert & getestet in `ocean_resources/model_tuning_catalog.py` (`load_model_tuning_catalog`, `resolve_model_tuning`, `detect_host_ram_gib`, `export_clutch_local_gears`) nach Vorrangkaskade `slot_override > model_config > catalog_default > env_fallback > safe_baseline`. |
 
 ---
 

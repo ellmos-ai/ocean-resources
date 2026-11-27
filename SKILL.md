@@ -24,6 +24,10 @@ Use this skill when developing, testing, or integrating with `ocean-resources`: 
    - Supply a host-owned snapshot of live `QueueTicket` objects with validated target keys; the host maps proximity classes to foreground/background.
    - Select one candidate with `select_next_ticket`; persist `next_foreground_streak` in the host. With both priorities live and no legacy foreground hold, background is selected after three foreground selections. A legacy hold selects nothing; the function neither enqueues nor dispatches work.
 
+3. **Hardware- & RAM-Coupled Model Tuning (`model_tuning_catalog`)**:
+   - Load `ocean.model-tuning-catalog.v1` via `load_model_tuning_catalog()` and resolve safe per-host `num_ctx`, KV-cache quantization, flash-attention, and tool-round defaults via `resolve_model_tuning(model_id, host_ram_gib=...)`.
+   - Export compatible local model gears via `export_clutch_local_gears(host_ram_gib=...)`.
+
 ## Code Patterns
 
 ```python

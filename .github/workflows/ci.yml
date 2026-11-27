@@ -34,7 +34,7 @@ jobs:
           cache: "pip"
       - name: Verify zero-dependency stdlib-only import
         run: |
-          python -c "import ocean_resources, ocean_resources.model_dispatch, ocean_resources.ram_distributor, ocean_resources.mlx_model_port"
+          python -c "import ocean_resources, ocean_resources.model_dispatch, ocean_resources.ram_distributor, ocean_resources.mlx_model_port, ocean_resources.model_tuning_catalog"
       - name: Install package and dev dependencies
         run: |
           python -m pip install --upgrade pip
@@ -48,7 +48,7 @@ jobs:
         run: python -m compileall -q ocean_resources tests
       - name: Verify sdist and wheel packaging contents
         run: |
-          python -c "import shutil, subprocess, sys, tarfile, tempfile, zipfile; from pathlib import Path; out = Path(tempfile.mkdtemp()); subprocess.run([sys.executable, '-m', 'build', '--no-isolation', '--sdist', '--wheel', '--outdir', str(out)], check=True); whl = next(out.glob('*.whl')); sdist = next(out.glob('*.tar.gz')); zf = zipfile.ZipFile(whl); wn = zf.namelist(); zf.close(); tf = tarfile.open(sdist); sn = tf.getnames(); tf.close(); assert any(n.endswith('LICENSE') for n in wn) and any(n.endswith('THIRD_PARTY_LICENSES.md') for n in wn); assert 'ocean_resources/py.typed' in wn and 'ocean_resources/manifest.json' in wn and 'ocean_resources/pipeline-catalog.json' in wn; assert any(n.endswith('/TODO.md') for n in sn) and any(n.endswith('/SECURITY.md') for n in sn); shutil.rmtree(out, ignore_errors=True)"
+          python -c "import shutil, subprocess, sys, tarfile, tempfile, zipfile; from pathlib import Path; out = Path(tempfile.mkdtemp()); subprocess.run([sys.executable, '-m', 'build', '--no-isolation', '--sdist', '--wheel', '--outdir', str(out)], check=True); whl = next(out.glob('*.whl')); sdist = next(out.glob('*.tar.gz')); zf = zipfile.ZipFile(whl); wn = zf.namelist(); zf.close(); tf = tarfile.open(sdist); sn = tf.getnames(); tf.close(); assert any(n.endswith('LICENSE') for n in wn) and any(n.endswith('THIRD_PARTY_LICENSES.md') for n in wn); assert 'ocean_resources/py.typed' in wn and 'ocean_resources/manifest.json' in wn and 'ocean_resources/pipeline-catalog.json' in wn and 'ocean_resources/model-tuning-catalog.v1.json' in wn; assert any(n.endswith('/ocean_resources/model-tuning-catalog.v1.json') for n in sn); assert any(n.endswith('/TODO.md') for n in sn) and any(n.endswith('/SECURITY.md') for n in sn); shutil.rmtree(out, ignore_errors=True)"
       - name: Smoke test packaged CLI resources
         run: |
           python -m ocean_resources manifest

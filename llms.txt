@@ -1,7 +1,7 @@
 # ocean-resources
 
 > Canonical RAM distributor, model runtime scheduler, torch arbiter, and watchdog hysteresis for BACH & Ocean.
-> Last-checked: 2026-11-24 | Version: 0.2.0
+> Last-checked: 2026-11-27 | Version: 0.2.0
 
 ## Overview
 
@@ -37,6 +37,9 @@
      - `UserProximity.DELEGATED_FOREGROUND = 2` (Actively delegated user tasks)
      - `UserProximity.SCHEDULED_ROUTINE = 3` (Scheduled calendar and routine tasks)
      - `UserProximity.AUTONOMOUS_BACKGROUND = 4` (Continuous idle/autonomous processing)
+
+3. **Stage 3: Hardware- & RAM-Coupled Model Tuning (`ocean_resources.model_tuning_catalog`)**
+   - Ships `model-tuning-catalog.v1.json` (`ocean.model-tuning-catalog.v1`) and stdlib-only resolver `resolve_model_tuning` (`slot_override > model_config > catalog_default > env_fallback > safe_baseline`) plus `detect_host_ram_gib` and `export_clutch_local_gears`.
 
 ## Key Python Interfaces
 
