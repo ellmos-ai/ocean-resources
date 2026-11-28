@@ -16,12 +16,12 @@ def test_catalog_loads_and_encodes_verified_mac_studio_32gb_boundary():
     assert cat["schema"] == CATALOG_SCHEMA
     assert len(cat["models"]) >= 6
 
-    # 32 GiB Apple M1 Max empirical optimum: 16384 ctx + 40 tool rounds (24k OOMs under load)
+    # 32 GiB Apple M1 Max: 12288 ctx + 40 tool rounds (prefill >12.3k tokens OOMs, 2026-11-28)
     t32 = resolve_model_tuning("inkling-2-mini:latest", host_ram_gib=32.0)
     assert t32.supported_on_host is True
-    assert t32.num_ctx == 16384
-    assert t32.num_ctx_safe == 16384
-    assert t32.num_ctx_max == 16384
+    assert t32.num_ctx == 12288
+    assert t32.num_ctx_safe == 12288
+    assert t32.num_ctx_max == 12288
     assert t32.num_ctx_source == "catalog_default"
     assert t32.recommended_max_tool_rounds == 40
     assert t32.handoff_percent == 75
@@ -102,7 +102,7 @@ def test_clutch_local_gears_export_filters_by_host_ram():
     gears_32 = export_clutch_local_gears(host_ram_gib=32.0)
     assert "ollama-inkling-2-mini" in gears_32
     ink = gears_32["ollama-inkling-2-mini"]
-    assert ink["num_ctx_safe"] == 16384
+    assert ink["num_ctx_safe"] == 12288
     assert ink["recommended_max_tool_rounds"] == 40
     assert ink["confidence_tier"] == "measured_live"
     assert ink["source_schema"] == CATALOG_SCHEMA
