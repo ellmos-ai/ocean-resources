@@ -34,7 +34,7 @@
         "host_class": "apple-silicon-32gb",
         "hardware": "Apple M1 Max 32 GiB Unified Memory (Metal recommendedMaxWorkingSetSize 24.96 GiB)",
         "runtime": "Ollama 0.40.17 MLX",
-        "summary": "16384 ctx + 40 tool rounds verified stable for 5+ hours without OOM; 24576 cold-loads cleanly (26.56s) but hits reproducible Metal OOM (kIOGPUCommandBufferCallbackErrorOutOfMemory) under multi-turn KV-cache load at tool 5-8 -> 24k+ gated to >=48 GiB."
+        "summary": "16384 ctx + 40 tool rounds ran stable for 5+ hours with prompts <12.3k tokens, but BACH worker prompts of 14.4k-18.6k tokens hit reproducible Metal OOM during prefill at 12288 processed tokens (2026-11-27/28, 12/12 HTTP 500) -> 32 GiB tier capped to 12288; 24576 cold-loads cleanly (26.56s) but hits reproducible Metal OOM (kIOGPUCommandBufferCallbackErrorOutOfMemory) under multi-turn KV-cache load at tool 5-8 -> 24k+ gated to >=48 GiB."
       },
       "ram_tiers": [
         {
@@ -54,8 +54,8 @@
         {
           "min_ram_gib": 32,
           "supported": true,
-          "num_ctx_safe": 16384,
-          "num_ctx_max": 16384,
+          "num_ctx_safe": 12288,
+          "num_ctx_max": 12288,
           "kv_cache_type": "q8_0",
           "flash_attention": true,
           "think_level": "auto",
@@ -63,7 +63,7 @@
           "handoff_percent": 75,
           "kv_headroom_gb": 1.5,
           "overhead_gb": 1.5,
-          "notes": "Empirically verified 32-GiB Apple Silicon optimum (2026-11-27); 24576 causes multi-turn Metal OOM."
+          "notes": "32-GiB Apple Silicon: prefill beyond ~12.3k prompt tokens hits reproducible Metal OOM (2026-11-28, 12/12 HTTP 500 at 14.4k-18.6k prompts with num_ctx 16384) -> capped to 12288; 24576 causes multi-turn Metal OOM."
         },
         {
           "min_ram_gib": 48,
